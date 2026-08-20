@@ -1,0 +1,45 @@
+name: Hummingbot Install Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  install-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout Hummingbot
+        uses: actions/checkout@v4
+        with:
+          repository: hummingbot/hummingbot
+          path: hummingbot
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential
+
+      - name: Inspect Hummingbot
+        working-directory: hummingbot
+        run: |
+          python --version
+          make --version
+          ls -la
+          sed -n '1,220p' Makefile
+
+      - name: Install Hummingbot
+        working-directory: hummingbot
+        run: make install
+
+      - name: Verify installation
+        working-directory: hummingbot
+        run: |
+          conda --version || true
+          python --version
+          echo "Hummingbot installation step completed."

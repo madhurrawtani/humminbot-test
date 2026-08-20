@@ -1,0 +1,34 @@
+name: Hummingbot Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Checkout Hummingbot source
+        uses: actions/checkout@v4
+        with:
+          repository: hummingbot/hummingbot
+          path: hummingbot
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Check source
+        working-directory: hummingbot
+        run: |
+          python --version
+          git rev-parse --short HEAD
+          ls -la
+
+      - name: Show workflow result
+        run: echo "Hummingbot source was successfully fetched."

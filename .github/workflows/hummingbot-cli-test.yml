@@ -1,0 +1,37 @@
+name: Hummingbot CLI Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  cli-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout Hummingbot
+        uses: actions/checkout@v4
+        with:
+          repository: hummingbot/hummingbot
+          path: hummingbot
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential
+
+      - name: Install Hummingbot
+        working-directory: hummingbot
+        run: make install
+
+      - name: Start Hummingbot
+        working-directory: hummingbot
+        run: |
+          source "$(conda info --base)/etc/profile.d/conda.sh"
+          conda activate hummingbot
+          hbot --version

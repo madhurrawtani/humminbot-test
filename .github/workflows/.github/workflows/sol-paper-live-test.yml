@@ -42,7 +42,7 @@ jobs:
           echo "Bot started with PID: $BOT_PID"
 
           # Let the paper bot trade for 2 hours
-          sleep 7200
+          sleep 1800
 
           echo "Stopping bot..."
           hbot stop || true

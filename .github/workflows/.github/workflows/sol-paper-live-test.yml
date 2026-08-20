@@ -1,0 +1,69 @@
+name: SOL Paper Live Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+
+    steps:
+      - name: Checkout Hummingbot
+        uses: actions/checkout@v4
+        with:
+          repository: hummingbot/hummingbot
+          path: hummingbot
+
+      - name: Install Hummingbot
+        working-directory: hummingbot
+        run: make install
+
+      - name: Create SOL paper strategy
+        working-directory: hummingbot
+        run: |
+          source "$(conda info --base)/etc/profile.d/conda.sh"
+          conda activate hummingbot
+
+          hbot create simple_pmm \
+            --name conf_sol.yml \
+            --set exchange=binance_paper_trade \
+            --set trading_pair=SOL-USDT
+
+      - name: Start bot
+        working-directory: hummingbot
+        run: |
+          source "$(conda info --base)/etc/profile.d/conda.sh"
+          conda activate hummingbot
+
+          hbot start &
+          BOT_PID=$!
+
+          echo "Bot started with PID: $BOT_PID"
+
+          # Let the paper bot trade for 2 hours
+          sleep 7200
+
+          echo "Stopping bot..."
+          hbot stop || true
+
+          wait $BOT_PID || true
+
+      - name: Show trading history
+        if: always()
+        working-directory: hummingbot
+        run: |
+          source "$(conda info --base)/etc/profile.d/conda.sh"
+          conda activate hummingbot
+
+          hbot history || true
+
+      - name: Save logs and data
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sol-paper-results
+          path: |
+            hummingbot/logs/
+            hummingbot/data/
+          if-no-files-found: warn

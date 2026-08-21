@@ -6,7 +6,7 @@ on:
 jobs:
   bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 20
 
     steps:
       - name: Checkout Hummingbot
@@ -32,7 +32,7 @@ jobs:
             --set exchange=binance_paper_trade \
             --set trading_pair=SOL-USDT
 
-      - name: Start bot
+      - name: Start SOL paper bot
         working-directory: hummingbot
         env:
           HBOT_PASSWORD: ${{ secrets.HBOT_PASSWORD }}
@@ -40,12 +40,17 @@ jobs:
           source "$(conda info --base)/etc/profile.d/conda.sh"
           conda activate hummingbot
 
-          hbot start &
+          echo "Starting V2 SOL paper bot..."
+
+          hbot start --v2 conf_sol.yml &
           BOT_PID=$!
 
-          echo "Bot started with PID: $BOT_PID"
+          echo "Bot PID: $BOT_PID"
 
           sleep 600
+
+          echo "Bot status:"
+          hbot status || true
 
           echo "Stopping bot..."
           hbot stop || true
@@ -61,14 +66,18 @@ jobs:
           source "$(conda info --base)/etc/profile.d/conda.sh"
           conda activate hummingbot
 
+          echo "=== HISTORY ==="
+          hbot history || true
+
+          echo "=== VERBOSE HISTORY ==="
           hbot history --verbose || true
 
-      - name: Save logs and data
+      - name: Save trading data
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: sol-paper-results
           path: |
-            hummingbot/logs/
-            hummingbot/data/
+            hummingbot/logs/**
+            hummingbot/data/**
           if-no-files-found: warn

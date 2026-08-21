@@ -21,6 +21,8 @@ jobs:
 
       - name: Create SOL paper strategy
         working-directory: hummingbot
+        env:
+          HBOT_PASSWORD: ${{ secrets.HBOT_PASSWORD }}
         run: |
           source "$(conda info --base)/etc/profile.d/conda.sh"
           conda activate hummingbot
@@ -32,6 +34,8 @@ jobs:
 
       - name: Start bot
         working-directory: hummingbot
+        env:
+          HBOT_PASSWORD: ${{ secrets.HBOT_PASSWORD }}
         run: |
           source "$(conda info --base)/etc/profile.d/conda.sh"
           conda activate hummingbot
@@ -41,7 +45,6 @@ jobs:
 
           echo "Bot started with PID: $BOT_PID"
 
-          # Run for 30 minutes
           sleep 1800
 
           echo "Stopping bot..."
@@ -52,11 +55,13 @@ jobs:
       - name: Show trading history
         if: always()
         working-directory: hummingbot
+        env:
+          HBOT_PASSWORD: ${{ secrets.HBOT_PASSWORD }}
         run: |
           source "$(conda info --base)/etc/profile.d/conda.sh"
           conda activate hummingbot
 
-          hbot history || true
+          hbot history --verbose || true
 
       - name: Save logs and data
         if: always()

@@ -45,7 +45,7 @@ jobs:
 
           echo "Bot started with PID: $BOT_PID"
 
-          sleep 1800
+          sleep 600
 
           echo "Stopping bot..."
           hbot stop || true

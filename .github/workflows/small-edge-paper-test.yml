@@ -1,0 +1,103 @@
+name: Small Edge SOL Paper Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+
+    steps:
+
+      - name: Checkout Hummingbot
+        uses: actions/checkout@v4
+        with:
+          repository: hummingbot/hummingbot
+          path: hummingbot
+
+      - name: Install Hummingbot
+        working-directory: hummingbot
+        run: make install
+
+      - name: Create strategy config
+        working-directory: hummingbot
+        env:
+          HBOT_PASSWORD: ${{ secrets.HBOT_PASSWORD }}
+        run: |
+
+          source "$(conda info --base)/etc/profile.d/conda.sh"
+          conda activate hummingbot
+
+          mkdir -p conf/scripts
+
+          cp ../scripts/small_edge_pmm.py conf/scripts/small_edge_pmm.py
+
+          hbot create --v2-config conf/scripts/small_edge_pmm.py
+
+      - name: Start paper bot
+        working-directory: hummingbot
+        env:
+          HBOT_PASSWORD: ${{ secrets.HBOT_PASSWORD }}
+        run: |
+
+          source "$(conda info --base)/etc/profile.d/conda.sh"
+          conda activate hummingbot
+
+          echo "Starting Small Edge PMM..."
+
+          hbot start --v2 conf/scripts/small_edge_pmm.yml \
+            > bot-output.log 2>&1 &
+
+          BOT_PID=$!
+
+          echo "Bot PID: $BOT_PID"
+
+          # 1 hour
+          sleep 3600
+
+          echo "=== BOT OUTPUT ==="
+          cat bot-output.log || true
+
+          echo "=== BOT STATUS ==="
+          hbot status || true
+
+          echo "=== STOPPING BOT ==="
+          hbot stop || true
+
+          kill "$BOT_PID" 2>/dev/null || true
+          wait "$BOT_PID" 2>/dev/null || true
+
+      - name: Collect results
+        if: always()
+        working-directory: hummingbot
+        run: |
+
+          source "$(conda info --base)/etc/profile.d/conda.sh"
+          conda activate hummingbot
+
+          echo "=== BOT OUTPUT ==="
+          cat bot-output.log 2>/dev/null || true
+
+          echo "=== LOG ==="
+          tail -n 500 logs/logs_small_edge_pmm.log 2>/dev/null || true
+
+          echo "=== STATUS ==="
+          hbot status || true
+
+          echo "=== DATA FILES ==="
+          find data -type f -print 2>/dev/null || true
+
+          echo "=== LOG FILES ==="
+          find logs -type f -print 2>/dev/null || true
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: small-edge-paper-results
+          path: |
+            hummingbot/bot-output.log
+            hummingbot/logs/**
+            hummingbot/data/**
+          if-no-files-found: warn

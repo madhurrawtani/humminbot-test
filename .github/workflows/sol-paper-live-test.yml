@@ -19,7 +19,7 @@ jobs:
         working-directory: hummingbot
         run: make install
 
-      - name: Create SOL paper strategy
+      - name: Create SOL paper bot
         working-directory: hummingbot
         env:
           HBOT_PASSWORD: ${{ secrets.HBOT_PASSWORD }}
@@ -40,44 +40,47 @@ jobs:
           source "$(conda info --base)/etc/profile.d/conda.sh"
           conda activate hummingbot
 
-          echo "Starting V2 SOL paper bot..."
+          echo "Starting SOL paper bot..."
 
-          hbot start --v2 conf_sol.yml &
+          hbot start conf_sol.yml > bot-output.log 2>&1 &
           BOT_PID=$!
 
           echo "Bot PID: $BOT_PID"
 
           sleep 600
 
-          echo "Bot status:"
+          echo "=== BOT OUTPUT ==="
+          cat bot-output.log || true
+
+          echo "=== BOT STATUS ==="
           hbot status || true
 
-          echo "Stopping bot..."
+          echo "=== STOPPING BOT ==="
           hbot stop || true
 
-          wait $BOT_PID || true
+          kill "$BOT_PID" 2>/dev/null || true
+          wait "$BOT_PID" 2>/dev/null || true
 
-      - name: Show trading history
+      - name: Collect logs and trading data
         if: always()
         working-directory: hummingbot
-        env:
-          HBOT_PASSWORD: ${{ secrets.HBOT_PASSWORD }}
         run: |
-          source "$(conda info --base)/etc/profile.d/conda.sh"
-          conda activate hummingbot
+          echo "=== LOG FILES ==="
+          find logs -type f -maxdepth 3 -print 2>/dev/null || true
 
-          echo "=== HISTORY ==="
-          hbot history || true
+          echo "=== DATA FILES ==="
+          find data -type f -maxdepth 3 -print 2>/dev/null || true
 
-          echo "=== VERBOSE HISTORY ==="
-          hbot history --verbose || true
+          echo "=== BOT OUTPUT ==="
+          cat bot-output.log 2>/dev/null || true
 
-      - name: Save trading data
+      - name: Upload paper trading results
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: sol-paper-results
           path: |
+            hummingbot/bot-output.log
             hummingbot/logs/**
             hummingbot/data/**
           if-no-files-found: warn

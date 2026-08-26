@@ -47,7 +47,7 @@ jobs:
 
           echo "Bot PID: $BOT_PID"
 
-          sleep 600
+          sleep 300
 
           echo "=== BOT OUTPUT ==="
           cat bot-output.log || true

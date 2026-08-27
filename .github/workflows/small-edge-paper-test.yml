@@ -9,6 +9,7 @@ jobs:
     timeout-minutes: 75
 
     steps:
+
       - name: Checkout test repository
         uses: actions/checkout@v4
 
@@ -24,28 +25,39 @@ jobs:
 
       - name: Install custom strategy
         run: |
-          source "$(conda info --base)/etc/profile.d/conda.sh"
-          conda activate hummingbot
+          echo "Installing custom strategy..."
 
-          mkdir -p hummingbot/conf/scripts
+          cp scripts/small_edge_pmm.py hummingbot/scripts/small_edge_pmm.py
 
-          cp scripts/small_edge_pmm.py hummingbot/conf/scripts/small_edge_pmm.py
+          echo "=== VERIFY STRATEGY ==="
+          ls -l hummingbot/scripts/small_edge_pmm.py
 
-          echo "=== CUSTOM SCRIPT ==="
-          ls -l hummingbot/conf/scripts/small_edge_pmm.py
-
-      - name: Create V2 script config
+      - name: Create strategy config
         working-directory: hummingbot
-        env:
-          HBOT_PASSWORD: ${{ secrets.HBOT_PASSWORD }}
+        run: |
+          mkdir -p conf/scripts
+
+          cat > conf/scripts/small_edge_pmm.yml <<'EOF'
+          script_file_name: small_edge_pmm.py
+          controllers_config: []
+          exchange: kraken_paper_trade
+          trading_pair: SOL-USD
+          order_amount: 0.05
+          min_edge_bps: 80
+          order_refresh_time: 2
+          price_type: mid
+          EOF
+
+          echo "=== STRATEGY CONFIG ==="
+          cat conf/scripts/small_edge_pmm.yml
+
+      - name: Verify strategy import
+        working-directory: hummingbot
         run: |
           source "$(conda info --base)/etc/profile.d/conda.sh"
           conda activate hummingbot
 
-          hbot create --v2-script small_edge_pmm
-
-          echo "=== SCRIPT CONFIG ==="
-          find conf/scripts -maxdepth 1 -type f -print
+          python -c "import scripts.small_edge_pmm; print('CUSTOM STRATEGY IMPORT: OK')"
 
       - name: Start Small Edge PMM
         working-directory: hummingbot
@@ -55,10 +67,9 @@ jobs:
           source "$(conda info --base)/etc/profile.d/conda.sh"
           conda activate hummingbot
 
-          echo "=== STARTING BOT ==="
+          echo "=== STARTING SMALL EDGE BOT ==="
 
-          hbot start conf/scripts/small_edge_pmm.yml \
-            > bot-output.log 2>&1 &
+          hbot start small_edge_pmm.yml > bot-output.log 2>&1 &
 
           BOT_PID=$!
 
@@ -88,14 +99,20 @@ jobs:
           echo "=== BOT OUTPUT ==="
           cat bot-output.log 2>/dev/null || true
 
-          echo "=== STATUS ==="
+          echo "=== BOT STATUS ==="
           hbot status || true
 
-          echo "=== LOG FILES ==="
+          echo "=== STRATEGY LOG ==="
+          tail -n 500 logs/logs_small_edge_pmm.log 2>/dev/null || true
+
+          echo "=== ALL LOG FILES ==="
           find logs -type f -print 2>/dev/null || true
 
-          echo "=== DATA FILES ==="
+          echo "=== ALL DATA FILES ==="
           find data -type f -print 2>/dev/null || true
+
+          echo "=== SQLITE DATABASES ==="
+          find . -name "*.sqlite" -print 2>/dev/null || true
 
       - name: Upload paper results
         if: always()
@@ -106,4 +123,6 @@ jobs:
             hummingbot/bot-output.log
             hummingbot/logs/**
             hummingbot/data/**
+            hummingbot/conf/scripts/small_edge_pmm.yml
+            hummingbot/*.sqlite
           if-no-files-found: warn

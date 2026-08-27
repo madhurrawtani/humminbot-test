@@ -9,6 +9,8 @@ jobs:
     timeout-minutes: 75
 
     steps:
+      - name: Checkout test repository
+        uses: actions/checkout@v4
 
       - name: Checkout Hummingbot
         uses: actions/checkout@v4
@@ -20,40 +22,46 @@ jobs:
         working-directory: hummingbot
         run: make install
 
-      - name: Create strategy config
-        working-directory: hummingbot
-        env:
-          HBOT_PASSWORD: ${{ secrets.HBOT_PASSWORD }}
+      - name: Install custom strategy
         run: |
-
           source "$(conda info --base)/etc/profile.d/conda.sh"
           conda activate hummingbot
 
-          mkdir -p conf/scripts
+          mkdir -p hummingbot/conf/scripts
 
-          cp ../scripts/small_edge_pmm.py conf/scripts/small_edge_pmm.py
+          cp scripts/small_edge_pmm.py hummingbot/conf/scripts/small_edge_pmm.py
 
-          hbot create --v2-config conf/scripts/small_edge_pmm.py
+          echo "=== CUSTOM STRATEGY ==="
+          ls -l hummingbot/conf/scripts/small_edge_pmm.py
 
-      - name: Start paper bot
+      - name: Create V2 config
         working-directory: hummingbot
         env:
           HBOT_PASSWORD: ${{ secrets.HBOT_PASSWORD }}
         run: |
+          source "$(conda info --base)/etc/profile.d/conda.sh"
+          conda activate hummingbot
 
+          hbot create --v2-config conf/scripts/small_edge_pmm.py
+
+          echo "=== CONFIG FILES ==="
+          find conf -maxdepth 3 -type f -print
+
+      - name: Start Small Edge PMM
+        working-directory: hummingbot
+        env:
+          HBOT_PASSWORD: ${{ secrets.HBOT_PASSWORD }}
+        run: |
           source "$(conda info --base)/etc/profile.d/conda.sh"
           conda activate hummingbot
 
           echo "Starting Small Edge PMM..."
 
-          hbot start --v2 conf/scripts/small_edge_pmm.yml \
-            > bot-output.log 2>&1 &
-
+          hbot start conf/scripts/small_edge_pmm.yml > bot-output.log 2>&1 &
           BOT_PID=$!
 
           echo "Bot PID: $BOT_PID"
 
-          # 1 hour
           sleep 3600
 
           echo "=== BOT OUTPUT ==="
@@ -72,26 +80,25 @@ jobs:
         if: always()
         working-directory: hummingbot
         run: |
-
           source "$(conda info --base)/etc/profile.d/conda.sh"
           conda activate hummingbot
 
           echo "=== BOT OUTPUT ==="
           cat bot-output.log 2>/dev/null || true
 
-          echo "=== LOG ==="
-          tail -n 500 logs/logs_small_edge_pmm.log 2>/dev/null || true
-
           echo "=== STATUS ==="
           hbot status || true
-
-          echo "=== DATA FILES ==="
-          find data -type f -print 2>/dev/null || true
 
           echo "=== LOG FILES ==="
           find logs -type f -print 2>/dev/null || true
 
-      - name: Upload results
+          echo "=== DATA FILES ==="
+          find data -type f -print 2>/dev/null || true
+
+          echo "=== STRATEGY CONFIG ==="
+          cat conf/scripts/small_edge_pmm.yml 2>/dev/null || true
+
+      - name: Upload paper results
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -100,4 +107,5 @@ jobs:
             hummingbot/bot-output.log
             hummingbot/logs/**
             hummingbot/data/**
+            hummingbot/conf/scripts/small_edge_pmm.yml
           if-no-files-found: warn

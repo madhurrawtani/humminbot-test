@@ -1,464 +1,252 @@
-import os
-import time
-import json
-import hmac
-import hashlib
-import requests
+from dataclasses import dataclass
 from decimal import Decimal
 
 
-BASE_URL = "https://api.coindcx.com"
+@dataclass
+class FuturesConfig:
+    capital_inr: Decimal = Decimal("1000")
 
-# GitHub Actions Secrets
-API_KEY = os.getenv("COINDCX_API_KEY")
-API_SECRET = os.getenv("COINDCX_SECRET_KEY")
+    # Start at 1x. No leverage amplification for testing.
+    leverage: Decimal = Decimal("1")
 
-CAPITAL_INR = Decimal("1000")
-LEVERAGE = Decimal("1")
+    # CoinDCX INR-margin futures maker fee = 0.02% = 2 bps.
+    maker_fee_bps: Decimal = Decimal("2")
 
-MAKER_FEE_BPS = Decimal("2")
-MIN_EDGE_BPS = Decimal("6")
+    # Entry + exit.
+    round_trip_fee_bps: Decimal = Decimal("4")
 
-TARGET = "DOGE"
+    # Extra protection against spread/slippage.
+    safety_buffer_bps: Decimal = Decimal("2")
 
+    # Minimum gross price movement required.
+    min_edge_bps: Decimal = Decimal("6")
 
-def signed_request(method, path, body=None):
-
-    if not API_KEY or not API_SECRET:
-        raise RuntimeError(
-            "CoinDCX API secrets are missing."
-        )
-
-    body = body or {}
-
-    body["timestamp"] = int(
-        time.time() * 1000
-    )
-
-    payload = json.dumps(
-        body,
-        separators=(",", ":")
-    )
-
-    signature = hmac.new(
-        API_SECRET.encode("utf-8"),
-        payload.encode("utf-8"),
-        hashlib.sha256
-    ).hexdigest()
-
-    headers = {
-        "Content-Type": "application/json",
-        "X-AUTH-APIKEY": API_KEY,
-        "X-AUTH-SIGNATURE": signature,
-    }
-
-    response = requests.request(
-        method,
-        BASE_URL + path,
-        data=payload,
-        headers=headers,
-        timeout=10,
-    )
-
-    response.raise_for_status()
-
-    return response.json()
+    # Never commit the entire account as margin.
+    max_margin_fraction: Decimal = Decimal("0.80")
 
 
-def get_active_instruments():
+class DogeFuturesStrategy:
 
-    url = (
-        BASE_URL
-        + "/exchange/v1/derivatives/futures/data/"
-        + "active_instruments"
-    )
+    def __init__(self, config=None):
 
-    response = requests.get(
-        url,
-        params={
-            "margin_currency_short_name[]": "INR"
-        },
-        timeout=10,
-    )
-
-    response.raise_for_status()
-
-    return response.json()
-
-
-def find_doge_instrument(instruments):
-
-    matches = []
-
-    for instrument in instruments:
-
-        text = str(instrument).upper()
-
-        if TARGET in text:
-            matches.append(instrument)
-
-    if not matches:
-
-        raise RuntimeError(
-            "DOGE INR-margin futures instrument not found."
-        )
-
-    print("\nDOGE instruments found:")
-
-    for item in matches:
-        print(item)
-
-    return matches[0]
-
-
-def get_instrument(pair):
-
-    url = (
-        BASE_URL
-        + "/exchange/v1/derivatives/futures/data/"
-        + "instrument"
-    )
-
-    response = requests.get(
-        url,
-        params={
-            "pair": pair,
-            "margin_currency_short_name": "INR",
-        },
-        timeout=10,
-    )
-
-    response.raise_for_status()
-
-    return response.json()
-
-
-def get_wallet():
-
-    return signed_request(
-        "GET",
-        "/exchange/v1/derivatives/futures/wallets",
-    )
-
-
-def get_positions():
-
-    return signed_request(
-        "POST",
-        "/exchange/v1/derivatives/futures/positions",
-        {
-            "page": "1",
-            "size": "50",
-            "margin_currency_short_name": ["INR"],
-        },
-    )
-
-
-def get_open_orders():
-
-    return signed_request(
-        "POST",
-        "/exchange/v1/derivatives/futures/orders",
-        {
-            "status": "open",
-            "page": "1",
-            "size": "50",
-            "margin_currency_short_name": ["INR"],
-        },
-    )
-
-
-def get_orderbook(pair):
-
-    url = (
-        "https://public.coindcx.com/"
-        "market_data/v3/orderbook/"
-        f"{pair}-futures/50"
-    )
-
-    response = requests.get(
-        url,
-        timeout=10,
-    )
-
-    response.raise_for_status()
-
-    return response.json()
-
-
-class PaperEngine:
-
-    def __init__(self):
-
-        self.balance = CAPITAL_INR
+        self.config = config or FuturesConfig()
 
         self.position = Decimal("0")
-
         self.entry_price = Decimal("0")
+        self.entry_side = None
 
         self.realized_pnl = Decimal("0")
-
         self.total_fees = Decimal("0")
-
         self.trade_count = 0
 
-    def mark_to_market(self, price):
+    @property
+    def max_margin(self):
+
+        return (
+            self.config.capital_inr
+            * self.config.max_margin_fraction
+        )
+
+    @property
+    def required_edge_bps(self):
+
+        return (
+            self.config.round_trip_fee_bps
+            + self.config.safety_buffer_bps
+        )
+
+    def calculate_move_bps(
+        self,
+        old_price,
+        new_price,
+    ):
+
+        old_price = Decimal(str(old_price))
+        new_price = Decimal(str(new_price))
+
+        if old_price <= 0:
+            return Decimal("0")
+
+        return (
+            abs(new_price - old_price)
+            / old_price
+            * Decimal("10000")
+        )
+
+    def calculate_fee(self, notional):
+
+        notional = Decimal(str(notional))
+
+        return (
+            notional
+            * self.config.maker_fee_bps
+            / Decimal("10000")
+        )
+
+    def choose_direction(
+        self,
+        previous_mid,
+        current_mid,
+    ):
+
+        previous_mid = Decimal(str(previous_mid))
+        current_mid = Decimal(str(current_mid))
+
+        if current_mid > previous_mid:
+            return "LONG"
+
+        if current_mid < previous_mid:
+            return "SHORT"
+
+        return None
+
+    def should_enter(
+        self,
+        previous_mid,
+        current_mid,
+        bid,
+        ask,
+    ):
+
+        if self.position != 0:
+            return False
+
+        previous_mid = Decimal(str(previous_mid))
+        current_mid = Decimal(str(current_mid))
+        bid = Decimal(str(bid))
+        ask = Decimal(str(ask))
+
+        mid = (
+            bid + ask
+        ) / Decimal("2")
+
+        if mid <= 0:
+            return False
+
+        spread_bps = (
+            (ask - bid)
+            / mid
+            * Decimal("10000")
+        )
+
+        # Don't enter if the current spread itself
+        # already consumes our available edge.
+        if spread_bps >= self.required_edge_bps:
+            return False
+
+        movement_bps = self.calculate_move_bps(
+            previous_mid,
+            current_mid,
+        )
+
+        if movement_bps < self.config.min_edge_bps:
+            return False
+
+        return True
+
+    def open_position(
+        self,
+        side,
+        price,
+        quantity,
+    ):
+
+        if self.position != 0:
+            return False
+
+        price = Decimal(str(price))
+        quantity = Decimal(str(quantity))
+
+        if price <= 0 or quantity <= 0:
+            return False
+
+        if side == "LONG":
+            self.position = quantity
+
+        elif side == "SHORT":
+            self.position = -quantity
+
+        else:
+            return False
+
+        self.entry_price = price
+        self.entry_side = side
+
+        entry_notional = (
+            price * quantity
+        )
+
+        self.total_fees += (
+            self.calculate_fee(
+                entry_notional
+            )
+        )
+
+        return True
+
+    def should_exit(
+        self,
+        current_price,
+    ):
+
+        if self.position == 0:
+            return False
+
+        movement_bps = self.calculate_move_bps(
+            self.entry_price,
+            current_price,
+        )
+
+        return (
+            movement_bps
+            >= self.config.min_edge_bps
+        )
+
+    def close_position(
+        self,
+        price,
+    ):
 
         if self.position == 0:
             return Decimal("0")
 
-        return (
-            price - self.entry_price
-        ) * self.position
+        price = Decimal(str(price))
 
-    def print_status(self, price):
+        quantity = abs(self.position)
 
-        unrealized = self.mark_to_market(price)
+        if self.position > 0:
 
-        print(
-            f"POSITION={self.position} "
-            f"ENTRY={self.entry_price} "
-            f"PRICE={price} "
-            f"REALIZED={self.realized_pnl:.4f} "
-            f"UNREALIZED={unrealized:.4f}"
+            gross_pnl = (
+                price - self.entry_price
+            ) * quantity
+
+        else:
+
+            gross_pnl = (
+                self.entry_price - price
+            ) * quantity
+
+        exit_notional = (
+            price * quantity
         )
 
-
-def main():
-
-    print(
-        "=== CoinDCX DOGE INR FUTURES PAPER BOT ==="
-    )
-
-    if not API_KEY:
-        raise RuntimeError(
-            "Missing GitHub Secret: COINDCX_API_KEY"
+        exit_fee = self.calculate_fee(
+            exit_notional
         )
 
-    if not API_SECRET:
-        raise RuntimeError(
-            "Missing GitHub Secret: COINDCX_SECRET_KEY"
+        net_pnl = (
+            gross_pnl
+            - exit_fee
         )
 
-    print("API credentials detected.")
+        self.realized_pnl += net_pnl
 
-    # -------------------------------------------------
-    # 1. Find active INR-margin futures instruments
-    # -------------------------------------------------
+        self.total_fees += exit_fee
 
-    instruments = get_active_instruments()
+        self.trade_count += 1
 
-    pair = find_doge_instrument(
-        instruments
-    )
+        self.position = Decimal("0")
+        self.entry_price = Decimal("0")
+        self.entry_side = None
 
-    print(
-        "\nSelected DOGE instrument:",
-        pair
-    )
-
-    # -------------------------------------------------
-    # 2. Verify instrument details
-    # -------------------------------------------------
-
-    instrument = get_instrument(pair)
-
-    print("\n=== INSTRUMENT DETAILS ===")
-
-    print(
-        json.dumps(
-            instrument,
-            indent=2
-        )
-    )
-
-    # -------------------------------------------------
-    # 3. Read authenticated futures wallet
-    # -------------------------------------------------
-
-    print("\n=== FUTURES WALLET ===")
-
-    wallet = get_wallet()
-
-    print(
-        json.dumps(
-            wallet,
-            indent=2
-        )
-    )
-
-    # -------------------------------------------------
-    # 4. Read current positions
-    # -------------------------------------------------
-
-    print("\n=== CURRENT POSITIONS ===")
-
-    positions = get_positions()
-
-    print(
-        json.dumps(
-            positions,
-            indent=2
-        )
-    )
-
-    # -------------------------------------------------
-    # 5. Read open orders
-    # -------------------------------------------------
-
-    print("\n=== OPEN ORDERS ===")
-
-    orders = get_open_orders()
-
-    print(
-        json.dumps(
-            orders,
-            indent=2
-        )
-    )
-
-    # -------------------------------------------------
-    # 6. Start PAPER engine
-    # -------------------------------------------------
-
-    paper = PaperEngine()
-
-    print("\n=== PAPER ENGINE ===")
-
-    print(
-        "Virtual capital:",
-        CAPITAL_INR,
-        "INR"
-    )
-
-    print(
-        "Leverage:",
-        LEVERAGE
-    )
-
-    print(
-        "Maker fee:",
-        MAKER_FEE_BPS,
-        "bps"
-    )
-
-    print(
-        "Minimum edge:",
-        MIN_EDGE_BPS,
-        "bps"
-    )
-
-    # -------------------------------------------------
-    # 7. Read market for 5 minutes
-    # -------------------------------------------------
-
-    print(
-        "\n=== LIVE MARKET DATA / PAPER MODE ==="
-    )
-
-    end_time = time.time() + 300
-
-    while time.time() < end_time:
-
-        try:
-
-            book = get_orderbook(pair)
-
-            bids = book.get(
-                "bids",
-                {}
-            )
-
-            asks = book.get(
-                "asks",
-                {}
-            )
-
-            if not bids or not asks:
-
-                print(
-                    "Order book unavailable..."
-                )
-
-                time.sleep(1)
-
-                continue
-
-            best_bid = max(
-                (
-                    Decimal(str(price))
-                    for price in bids.keys()
-                )
-            )
-
-            best_ask = min(
-                (
-                    Decimal(str(price))
-                    for price in asks.keys()
-                )
-            )
-
-            mid = (
-                best_bid + best_ask
-            ) / Decimal("2")
-
-            spread_bps = (
-                (best_ask - best_bid)
-                / mid
-                * Decimal("10000")
-            )
-
-            print(
-                f"BID={best_bid} "
-                f"ASK={best_ask} "
-                f"MID={mid} "
-                f"SPREAD={spread_bps:.2f}bps"
-            )
-
-            paper.print_status(mid)
-
-        except Exception as error:
-
-            print(
-                "Market-data error:",
-                error
-            )
-
-        time.sleep(1)
-
-    # -------------------------------------------------
-    # 8. Final result
-    # -------------------------------------------------
-
-    print("\n=== PAPER TEST COMPLETE ===")
-
-    print(
-        "Trades:",
-        paper.trade_count
-    )
-
-    print(
-        "Realized PnL:",
-        paper.realized_pnl,
-        "INR"
-    )
-
-    print(
-        "Fees:",
-        paper.total_fees,
-        "INR"
-    )
-
-    print(
-        "Final paper balance:",
-        paper.balance,
-        "INR"
-    )
-
-    print(
-        "\nNO LIVE ORDERS WERE SENT."
-    )
-
-
-if __name__ == "__main__":
-    main()
+        return net_pnl

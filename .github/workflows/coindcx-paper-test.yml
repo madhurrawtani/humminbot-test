@@ -9,7 +9,7 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - name: Checkout bot
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Setup Python
@@ -24,24 +24,46 @@ jobs:
 
       - name: Verify bot files
         run: |
-          echo "=== BOT FILE ==="
-          ls -lh coin-dcx-bot/bot.py
+          echo "=== BOT FILES ==="
+          ls -lah coin-dcx-bot/
 
-          echo "=== PYTHON SYNTAX CHECK ==="
+          echo "=== CHECK BOT ==="
           python -m py_compile coin-dcx-bot/bot.py
+
+          echo "=== CHECK STRATEGY ==="
+          python -m py_compile coin-dcx-bot/strategy.py
 
       - name: Run 5-minute paper test
         env:
           COINDCX_API_KEY: ${{ secrets.COINDCX_API_KEY }}
           COINDCX_SECRET_KEY: ${{ secrets.COINDCX_SECRET_KEY }}
         run: |
-          echo "=== STARTING COINDCX PAPER TEST ==="
+          echo "=========================================="
+          echo " COINDCX DOGE FUTURES PAPER TEST"
+          echo "=========================================="
           echo "Duration: 300 seconds"
+          echo "Capital: ₹1000 virtual"
           echo "Live orders: DISABLED"
+          echo ""
 
-          python coin-dcx-bot/bot.py 2>&1 | tee coindcx-paper-output.log
+          cd coin-dcx-bot
 
-      - name: Upload results
+          python bot.py 2>&1 | tee ../coindcx-paper-output.log
+
+      - name: Show results
+        if: always()
+        run: |
+          echo "=========================================="
+          echo " TEST OUTPUT"
+          echo "=========================================="
+
+          if [ -f coindcx-paper-output.log ]; then
+            cat coindcx-paper-output.log
+          else
+            echo "No output file found."
+          fi
+
+      - name: Upload paper test results
         if: always()
         uses: actions/upload-artifact@v4
         with:

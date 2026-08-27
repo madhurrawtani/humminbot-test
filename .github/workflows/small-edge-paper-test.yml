@@ -31,10 +31,10 @@ jobs:
 
           cp scripts/small_edge_pmm.py hummingbot/conf/scripts/small_edge_pmm.py
 
-          echo "=== CUSTOM STRATEGY ==="
+          echo "=== CUSTOM SCRIPT ==="
           ls -l hummingbot/conf/scripts/small_edge_pmm.py
 
-      - name: Create V2 config
+      - name: Create V2 script config
         working-directory: hummingbot
         env:
           HBOT_PASSWORD: ${{ secrets.HBOT_PASSWORD }}
@@ -42,10 +42,10 @@ jobs:
           source "$(conda info --base)/etc/profile.d/conda.sh"
           conda activate hummingbot
 
-          hbot create --v2-config conf/scripts/small_edge_pmm.py
+          hbot create --v2-script small_edge_pmm
 
-          echo "=== CONFIG FILES ==="
-          find conf -maxdepth 3 -type f -print
+          echo "=== SCRIPT CONFIG ==="
+          find conf/scripts -maxdepth 1 -type f -print
 
       - name: Start Small Edge PMM
         working-directory: hummingbot
@@ -55,9 +55,11 @@ jobs:
           source "$(conda info --base)/etc/profile.d/conda.sh"
           conda activate hummingbot
 
-          echo "Starting Small Edge PMM..."
+          echo "=== STARTING BOT ==="
 
-          hbot start conf/scripts/small_edge_pmm.yml > bot-output.log 2>&1 &
+          hbot start conf/scripts/small_edge_pmm.yml \
+            > bot-output.log 2>&1 &
+
           BOT_PID=$!
 
           echo "Bot PID: $BOT_PID"
@@ -95,9 +97,6 @@ jobs:
           echo "=== DATA FILES ==="
           find data -type f -print 2>/dev/null || true
 
-          echo "=== STRATEGY CONFIG ==="
-          cat conf/scripts/small_edge_pmm.yml 2>/dev/null || true
-
       - name: Upload paper results
         if: always()
         uses: actions/upload-artifact@v4
@@ -107,5 +106,4 @@ jobs:
             hummingbot/bot-output.log
             hummingbot/logs/**
             hummingbot/data/**
-            hummingbot/conf/scripts/small_edge_pmm.yml
           if-no-files-found: warn

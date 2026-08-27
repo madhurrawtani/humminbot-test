@@ -1,4 +1,4 @@
-name: Small Edge SOL Paper Test
+name: Small Edge DOGE Paper Test
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
 jobs:
   bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 75
+    timeout-minutes: 15
 
     steps:
 
@@ -25,14 +25,14 @@ jobs:
 
       - name: Install custom strategy
         run: |
-          echo "Installing custom strategy..."
+          echo "Installing DOGE strategy..."
 
           cp scripts/small_edge_pmm.py hummingbot/scripts/small_edge_pmm.py
 
           echo "=== VERIFY STRATEGY ==="
-          ls -l hummingbot/scripts/small_edge_pmm.py
+          ls -lh hummingbot/scripts/small_edge_pmm.py
 
-      - name: Create strategy config
+      - name: Create DOGE strategy config
         working-directory: hummingbot
         run: |
           mkdir -p conf/scripts
@@ -41,14 +41,14 @@ jobs:
           script_file_name: small_edge_pmm.py
           controllers_config: []
           exchange: kraken_paper_trade
-          trading_pair: SOL-USD
-          order_amount: 0.05
+          trading_pair: DOGE-USD
+          order_amount: 5
           min_edge_bps: 80
-          order_refresh_time: 2
+          order_refresh_time: 10
           price_type: mid
           EOF
 
-          echo "=== STRATEGY CONFIG ==="
+          echo "=== CONFIG ==="
           cat conf/scripts/small_edge_pmm.yml
 
       - name: Verify strategy import
@@ -57,9 +57,9 @@ jobs:
           source "$(conda info --base)/etc/profile.d/conda.sh"
           conda activate hummingbot
 
-          python -c "import scripts.small_edge_pmm; print('CUSTOM STRATEGY IMPORT: OK')"
+          python -c "import scripts.small_edge_pmm; print('DOGE STRATEGY IMPORT: OK')"
 
-      - name: Start Small Edge PMM
+      - name: Start DOGE paper bot
         working-directory: hummingbot
         env:
           HBOT_PASSWORD: ${{ secrets.HBOT_PASSWORD }}
@@ -67,7 +67,7 @@ jobs:
           source "$(conda info --base)/etc/profile.d/conda.sh"
           conda activate hummingbot
 
-          echo "=== STARTING SMALL EDGE BOT ==="
+          echo "=== STARTING DOGE PAPER BOT ==="
 
           hbot start small_edge_pmm.yml > bot-output.log 2>&1 &
 
@@ -75,7 +75,9 @@ jobs:
 
           echo "Bot PID: $BOT_PID"
 
-          sleep 3600
+          echo "=== RUNNING FOR 300 SECONDS ==="
+
+          sleep 300
 
           echo "=== BOT OUTPUT ==="
           cat bot-output.log || true
@@ -118,7 +120,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: small-edge-paper-results
+          name: small-edge-doge-paper-results
           path: |
             hummingbot/bot-output.log
             hummingbot/logs/**
@@ -126,3 +128,4 @@ jobs:
             hummingbot/conf/scripts/small_edge_pmm.yml
             hummingbot/*.sqlite
           if-no-files-found: warn
+          

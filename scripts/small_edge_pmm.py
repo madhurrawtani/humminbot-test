@@ -6,7 +6,12 @@ from typing import Dict, List
 from pydantic import Field
 
 from hummingbot.connector.connector_base import ConnectorBase
-from hummingbot.core.data_type.common import MarketDict, OrderType, PriceType, TradeType
+from hummingbot.core.data_type.common import (
+    MarketDict,
+    OrderType,
+    PriceType,
+    TradeType,
+)
 from hummingbot.core.data_type.order_candidate import OrderCandidate
 from hummingbot.core.event.events import OrderFilledEvent
 from hummingbot.strategy.strategy_v2_base import StrategyV2Base, StrategyV2ConfigBase
@@ -17,17 +22,19 @@ class SmallEdgePMMConfig(StrategyV2ConfigBase):
 
     controllers_config: List[str] = []
 
+    # Exchange / market
     exchange: str = Field("kraken_paper_trade")
-    trading_pair: str = Field("SOL-USD")
+    trading_pair: str = Field("DOGE-USD")
 
-    order_amount: Decimal = Field(Decimal("0.05"))
+    # Small-capital test
+    order_amount: Decimal = Field(Decimal("5"))
 
-    # Total minimum round-trip edge required.
+    # Required round-trip edge.
     # 80 bps = 0.80%
     min_edge_bps: Decimal = Field(Decimal("80"))
 
-    # How often orders are refreshed.
-    order_refresh_time: int = Field(2)
+    # Give orders time to fill.
+    order_refresh_time: int = Field(10)
 
     price_type: str = Field("mid")
 
@@ -59,19 +66,23 @@ class SmallEdgePMM(StrategyV2Base):
         )
 
     def on_tick(self):
+
         if self.create_timestamp > self.current_timestamp:
             return
 
+        # Cancel previous quotes before replacing them.
         self.cancel_all_orders()
 
         proposal = self.create_proposal()
 
+        # Prevent orders from exceeding available paper balance.
         proposal_adjusted = self.adjust_proposal_to_budget(proposal)
 
         self.place_orders(proposal_adjusted)
 
         self.create_timestamp = (
-            self.current_timestamp + self.config.order_refresh_time
+            self.current_timestamp
+            + self.config.order_refresh_time
         )
 
     def create_proposal(self) -> List[OrderCandidate]:
@@ -83,20 +94,27 @@ class SmallEdgePMM(StrategyV2Base):
             self.price_source,
         )
 
-        # Convert total required edge into half-spread.
+        # Split the required round-trip edge equally
+        # between the buy and sell side.
         #
         # Example:
-        # 80 bps total round-trip edge
-        # => 40 bps below mid for BUY
-        # => 40 bps above mid for SELL
+        # 80 bps total
+        # BUY  = 40 bps below mid
+        # SELL = 40 bps above mid
+
         half_edge = (
             self.config.min_edge_bps
             / Decimal("2")
             / Decimal("10000")
         )
 
-        buy_price = mid_price * (Decimal("1") - half_edge)
-        sell_price = mid_price * (Decimal("1") + half_edge)
+        buy_price = mid_price * (
+            Decimal("1") - half_edge
+        )
+
+        sell_price = mid_price * (
+            Decimal("1") + half_edge
+        )
 
         buy_order = OrderCandidate(
             trading_pair=self.config.trading_pair,
@@ -116,7 +134,10 @@ class SmallEdgePMM(StrategyV2Base):
             price=sell_price,
         )
 
-        return [buy_order, sell_order]
+        return [
+            buy_order,
+            sell_order,
+        ]
 
     def adjust_proposal_to_budget(
         self,
@@ -130,9 +151,20 @@ class SmallEdgePMM(StrategyV2Base):
             all_or_none=True,
         )
 
-    def place_orders(self, proposal: List[OrderCandidate]):
+    def place_orders(
+        self,
+        proposal: List[OrderCandidate],
+    ):
 
         for order in proposal:
+
+            # IMPORTANT:
+            # The previous test generated zero-size BUY
+            # orders because of insufficient USD balance.
+            # Never submit a zero-sized order.
+
+            if order.amount <= Decimal("0"):
+                continue
 
             if order.order_side == TradeType.BUY:
 
@@ -166,11 +198,16 @@ class SmallEdgePMM(StrategyV2Base):
                 order.client_order_id,
             )
 
-    def did_fill_order(self, event: OrderFilledEvent):
+    def did_fill_order(
+        self,
+        event: OrderFilledEvent,
+    ):
 
         message = (
-            f"FILL | {event.trade_type.name} "
-            f"{event.amount} {event.trading_pair} "
+            f"FILL | "
+            f"{event.trade_type.name} "
+            f"{event.amount} "
+            f"{event.trading_pair} "
             f"@ {event.price}"
         )
 
@@ -179,4 +216,6 @@ class SmallEdgePMM(StrategyV2Base):
             message,
         )
 
-        self.notify_hb_app_with_timestamp(message)
+        self.notify_hb_app_with_timestamp(
+            message
+        )

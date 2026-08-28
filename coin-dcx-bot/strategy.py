@@ -5,35 +5,33 @@ from decimal import Decimal
 @dataclass
 class FuturesConfig:
     capital_inr: Decimal = Decimal("1000")
-
-    # Start at 1x. No leverage amplification for testing.
     leverage: Decimal = Decimal("1")
 
-    # CoinDCX INR-margin futures maker fee = 0.02% = 2 bps.
-    maker_fee_bps: Decimal = Decimal("2")
+    # CoinDCX DOGE_USDT instrument reports 0.0236%.
+    maker_fee_bps: Decimal = Decimal("2.36")
 
-    # Entry + exit.
-    round_trip_fee_bps: Decimal = Decimal("4")
+    # Entry + exit maker fees.
+    round_trip_fee_bps: Decimal = Decimal("4.72")
 
-    # Extra protection against spread/slippage.
-    safety_buffer_bps: Decimal = Decimal("2")
+    # Additional minimum profit buffer.
+    profit_buffer_bps: Decimal = Decimal("1.00")
 
-    # Minimum gross price movement required.
-    min_edge_bps: Decimal = Decimal("6")
-
-    # Never commit the entire account as margin.
+    # Never use the complete paper balance as margin.
     max_margin_fraction: Decimal = Decimal("0.80")
+
+    # Maximum paper-position lifetime.
+    max_position_seconds: int = 60
 
 
 class DogeFuturesStrategy:
 
     def __init__(self, config=None):
-
         self.config = config or FuturesConfig()
 
         self.position = Decimal("0")
         self.entry_price = Decimal("0")
         self.entry_side = None
+        self.entry_time = 0
 
         self.realized_pnl = Decimal("0")
         self.total_fees = Decimal("0")
@@ -41,18 +39,62 @@ class DogeFuturesStrategy:
 
     @property
     def max_margin(self):
-
         return (
             self.config.capital_inr
             * self.config.max_margin_fraction
         )
 
     @property
-    def required_edge_bps(self):
-
+    def minimum_net_edge_bps(self):
         return (
             self.config.round_trip_fee_bps
-            + self.config.safety_buffer_bps
+            + self.config.profit_buffer_bps
+        )
+
+    def fee(self, notional):
+        return (
+            Decimal(str(notional))
+            * self.config.maker_fee_bps
+            / Decimal("10000")
+        )
+
+    def mid_price(self, bid, ask):
+        return (
+            Decimal(str(bid))
+            + Decimal(str(ask))
+        ) / Decimal("2")
+
+    def spread_bps(self, bid, ask):
+
+        bid = Decimal(str(bid))
+        ask = Decimal(str(ask))
+
+        mid = self.mid_price(bid, ask)
+
+        if mid <= 0:
+            return Decimal("0")
+
+        return (
+            (ask - bid)
+            / mid
+            * Decimal("10000")
+        )
+
+    def quote_prices(self, bid, ask):
+
+        bid = Decimal(str(bid))
+        ask = Decimal(str(ask))
+
+        return bid, ask
+
+    def should_quote(self, bid, ask):
+
+        bid = Decimal(str(bid))
+        ask = Decimal(str(ask))
+
+        return (
+            bid > 0
+            and ask > bid
         )
 
     def calculate_move_bps(
@@ -71,16 +113,6 @@ class DogeFuturesStrategy:
             abs(new_price - old_price)
             / old_price
             * Decimal("10000")
-        )
-
-    def calculate_fee(self, notional):
-
-        notional = Decimal(str(notional))
-
-        return (
-            notional
-            * self.config.maker_fee_bps
-            / Decimal("10000")
         )
 
     def choose_direction(
@@ -116,22 +148,13 @@ class DogeFuturesStrategy:
         bid = Decimal(str(bid))
         ask = Decimal(str(ask))
 
-        mid = (
-            bid + ask
-        ) / Decimal("2")
-
-        if mid <= 0:
+        if previous_mid <= 0:
             return False
 
-        spread_bps = (
-            (ask - bid)
-            / mid
-            * Decimal("10000")
-        )
+        if current_mid <= 0:
+            return False
 
-        # Don't enter if the current spread itself
-        # already consumes our available edge.
-        if spread_bps >= self.required_edge_bps:
+        if ask <= bid:
             return False
 
         movement_bps = self.calculate_move_bps(
@@ -139,16 +162,65 @@ class DogeFuturesStrategy:
             current_mid,
         )
 
-        if movement_bps < self.config.min_edge_bps:
+        # This is intentionally much lower than the
+        # old 6-bps requirement. The strategy is now
+        # based on short-term order-book movement.
+        signal_threshold_bps = Decimal("1.00")
+
+        if movement_bps < signal_threshold_bps:
             return False
 
         return True
 
-    def open_position(
+    def should_exit(
+        self,
+        entry_price,
+        current_price,
+        current_time,
+    ):
+
+        if self.position == 0:
+            return False
+
+        entry_price = Decimal(str(entry_price))
+        current_price = Decimal(str(current_price))
+
+        if entry_price <= 0:
+            return False
+
+        if self.position > 0:
+
+            move_bps = (
+                (current_price - entry_price)
+                / entry_price
+                * Decimal("10000")
+            )
+
+        else:
+
+            move_bps = (
+                (entry_price - current_price)
+                / entry_price
+                * Decimal("10000")
+            )
+
+        if move_bps >= self.minimum_net_edge_bps:
+            return True
+
+        if (
+            current_time - self.entry_time
+            >= self.config.max_position_seconds
+        ):
+            return True
+
+        return False
+
+    def open(
         self,
         side,
         price,
         quantity,
+        timestamp,
     ):
 
         if self.position != 0:
@@ -171,47 +243,16 @@ class DogeFuturesStrategy:
 
         self.entry_price = price
         self.entry_side = side
-
-        entry_notional = (
-            price * quantity
-        )
-
-        self.total_fees += (
-            self.calculate_fee(
-                entry_notional
-            )
-        )
+        self.entry_time = timestamp
 
         return True
 
-    def should_exit(
-        self,
-        current_price,
-    ):
-
-        if self.position == 0:
-            return False
-
-        movement_bps = self.calculate_move_bps(
-            self.entry_price,
-            current_price,
-        )
-
-        return (
-            movement_bps
-            >= self.config.min_edge_bps
-        )
-
-    def close_position(
-        self,
-        price,
-    ):
+    def close(self, price):
 
         if self.position == 0:
             return Decimal("0")
 
         price = Decimal(str(price))
-
         quantity = abs(self.position)
 
         if self.position > 0:
@@ -226,27 +267,37 @@ class DogeFuturesStrategy:
                 self.entry_price - price
             ) * quantity
 
+        entry_notional = (
+            self.entry_price * quantity
+        )
+
         exit_notional = (
             price * quantity
         )
 
-        exit_fee = self.calculate_fee(
+        entry_fee = self.fee(
+            entry_notional
+        )
+
+        exit_fee = self.fee(
             exit_notional
         )
 
+        total_fee = (
+            entry_fee + exit_fee
+        )
+
         net_pnl = (
-            gross_pnl
-            - exit_fee
+            gross_pnl - total_fee
         )
 
         self.realized_pnl += net_pnl
-
-        self.total_fees += exit_fee
-
+        self.total_fees += total_fee
         self.trade_count += 1
 
         self.position = Decimal("0")
         self.entry_price = Decimal("0")
         self.entry_side = None
+        self.entry_time = 0
 
         return net_pnl

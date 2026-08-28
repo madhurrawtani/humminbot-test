@@ -15,6 +15,7 @@ API_KEY = os.getenv("COINDCX_API_KEY")
 API_SECRET = os.getenv("COINDCX_SECRET_KEY")
 
 TEST_SECONDS = 300
+TARGET_PAIR = "B-DOGE_USDT"
 
 
 def public_get(path, params=None):
@@ -23,17 +24,23 @@ def public_get(path, params=None):
         params=params,
         timeout=10,
     )
+
     response.raise_for_status()
+
     return response.json()
 
 
-def signed_post(path, body=None):
+def signed_get(path, body=None):
+
     if not API_KEY or not API_SECRET:
         raise RuntimeError(
-            "COINDCX_API_KEY / COINDCX_SECRET_KEY missing"
+            "CoinDCX API secrets are missing."
         )
 
     body = body or {}
+
+    # CoinDCX documentation uses timestamp in the
+    # authenticated request body.
     body["timestamp"] = int(time.time() * 1000)
 
     payload = json.dumps(
@@ -42,8 +49,48 @@ def signed_post(path, body=None):
     )
 
     signature = hmac.new(
-        API_SECRET.encode(),
-        payload.encode(),
+        API_SECRET.encode("utf-8"),
+        payload.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+    headers = {
+        "Content-Type": "application/json",
+        "X-AUTH-APIKEY": API_KEY,
+        "X-AUTH-SIGNATURE": signature,
+    }
+
+    response = requests.get(
+        BASE_URL + path,
+        data=payload,
+        headers=headers,
+        timeout=10,
+    )
+
+    response.raise_for_status()
+
+    return response.json()
+
+
+def signed_post(path, body=None):
+
+    if not API_KEY or not API_SECRET:
+        raise RuntimeError(
+            "CoinDCX API secrets are missing."
+        )
+
+    body = body or {}
+
+    body["timestamp"] = int(time.time() * 1000)
+
+    payload = json.dumps(
+        body,
+        separators=(",", ":"),
+    )
+
+    signature = hmac.new(
+        API_SECRET.encode("utf-8"),
+        payload.encode("utf-8"),
         hashlib.sha256,
     ).hexdigest()
 
@@ -61,6 +108,7 @@ def signed_post(path, body=None):
     )
 
     response.raise_for_status()
+
     return response.json()
 
 
@@ -69,33 +117,22 @@ def get_active_instruments():
     return public_get(
         "/exchange/v1/derivatives/futures/data/active_instruments",
         {
-            "margin_currency_short_name[]": "INR"
+            "margin_currency_short_name[]": "INR",
         },
     )
 
 
 def find_doge_instrument(instruments):
 
-    matches = []
-
+    # Exact DOGE only.
     for instrument in instruments:
 
-        text = str(instrument).upper()
+        if instrument == TARGET_PAIR:
+            return instrument
 
-        if "DOGE" in text:
-            matches.append(instrument)
-
-    if not matches:
-        raise RuntimeError(
-            "No DOGE INR futures instrument found"
-        )
-
-    print("DOGE instruments found:")
-
-    for item in matches:
-        print(" ", item)
-
-    return matches[0]
+    raise RuntimeError(
+        f"{TARGET_PAIR} was not found in active INR futures."
+    )
 
 
 def get_instrument(pair):
@@ -111,7 +148,7 @@ def get_instrument(pair):
 
 def get_wallet():
 
-    return signed_post(
+    return signed_get(
         "/exchange/v1/derivatives/futures/wallets",
         {},
     )
@@ -125,6 +162,7 @@ def get_positions():
             "page": "1",
             "size": "50",
             "margin_currency_short_name": ["INR"],
+            "pairs": TARGET_PAIR,
         },
     )
 
@@ -151,8 +189,13 @@ class PaperAccount:
 
     def __init__(self, capital):
 
-        self.starting_balance = Decimal(str(capital))
-        self.balance = Decimal(str(capital))
+        self.starting_balance = Decimal(
+            str(capital)
+        )
+
+        self.balance = Decimal(
+            str(capital)
+        )
 
         self.position = Decimal("0")
         self.entry_price = Decimal("0")
@@ -160,7 +203,6 @@ class PaperAccount:
 
         self.realized_pnl = Decimal("0")
         self.unrealized_pnl = Decimal("0")
-
         self.fees = Decimal("0")
 
         self.entries = 0
@@ -174,18 +216,20 @@ class PaperAccount:
         strategy,
     ):
 
-        price = Decimal(str(price))
-        quantity = Decimal(str(quantity))
-
         if self.position != 0:
             return False
+
+        price = Decimal(str(price))
+        quantity = Decimal(str(quantity))
 
         notional = price * quantity
 
         if notional > strategy.max_margin:
             return False
 
-        fee = strategy.calculate_fee(notional)
+        fee = strategy.calculate_fee(
+            notional
+        )
 
         if fee > self.balance:
             return False
@@ -193,11 +237,14 @@ class PaperAccount:
         self.balance -= fee
         self.fees += fee
 
-        self.position = (
-            quantity
-            if side == "LONG"
-            else -quantity
-        )
+        if side == "LONG":
+            self.position = quantity
+
+        elif side == "SHORT":
+            self.position = -quantity
+
+        else:
+            return False
 
         self.entry_price = price
         self.entry_side = side
@@ -260,9 +307,7 @@ class PaperAccount:
         net = gross - exit_fee
 
         self.balance += net
-
         self.realized_pnl += net
-
         self.fees += exit_fee
 
         self.exits += 1
@@ -282,7 +327,7 @@ def main():
     )
 
     print(
-        " CoinDCX DOGE FUTURES PAPER BOT"
+        " COINDCX DOGE FUTURES PAPER BOT"
     )
 
     print(
@@ -299,11 +344,11 @@ def main():
             "Missing secret: COINDCX_SECRET_KEY"
         )
 
-    print("\nAPI credentials detected.")
+    print("API credentials detected.")
 
-    # ------------------------------------------
-    # Find DOGE INR futures
-    # ------------------------------------------
+    # ==========================================
+    # FIND EXACT DOGE CONTRACT
+    # ==========================================
 
     instruments = get_active_instruments()
 
@@ -316,6 +361,10 @@ def main():
         pair,
     )
 
+    # ==========================================
+    # INSTRUMENT DETAILS
+    # ==========================================
+
     instrument = get_instrument(pair)
 
     print("\n=== INSTRUMENT ===")
@@ -327,35 +376,73 @@ def main():
         )
     )
 
-    # ------------------------------------------
-    # Read real account
-    # ------------------------------------------
+    # ==========================================
+    # REAL ACCOUNT WALLET
+    # ==========================================
 
     print("\n=== ACCOUNT WALLET ===")
 
-    wallet = get_wallet()
+    try:
 
-    print(
-        json.dumps(
-            wallet,
-            indent=2,
+        wallet = get_wallet()
+
+        print(
+            json.dumps(
+                wallet,
+                indent=2,
+            )
         )
-    )
 
-    print("\n=== CURRENT POSITIONS ===")
+    except requests.HTTPError as error:
 
-    positions = get_positions()
+        if (
+            error.response is not None
+            and error.response.status_code == 404
+        ):
 
-    print(
-        json.dumps(
-            positions,
-            indent=2,
+            print(
+                "Futures wallet does not exist yet."
+            )
+
+            print(
+                "Continuing in PAPER-ONLY mode."
+            )
+
+        else:
+
+            raise
+
+    # ==========================================
+    # REAL POSITIONS
+    # ==========================================
+
+    print("\n=== CURRENT DOGE POSITIONS ===")
+
+    try:
+
+        positions = get_positions()
+
+        print(
+            json.dumps(
+                positions,
+                indent=2,
+            )
         )
-    )
 
-    # ------------------------------------------
-    # Paper strategy
-    # ------------------------------------------
+    except requests.HTTPError as error:
+
+        print(
+            "Could not read positions:",
+            error,
+        )
+
+        print(
+            "Continuing in PAPER-ONLY mode."
+        )
+
+    # ==========================================
+    # PAPER STRATEGY
+    # ==========================================
 
     config = FuturesConfig(
         capital_inr=Decimal("1000"),
@@ -378,7 +465,7 @@ def main():
     print("\n=== PAPER ACCOUNT ===")
 
     print(
-        "Starting capital:",
+        "Virtual capital:",
         paper.starting_balance,
         "INR",
     )
@@ -394,9 +481,9 @@ def main():
         "bps",
     )
 
-    # ------------------------------------------
-    # Market-data loop
-    # ------------------------------------------
+    # ==========================================
+    # 5 MINUTE PAPER TEST
+    # ==========================================
 
     print(
         "\n=== STARTING 5-MINUTE PAPER TEST ==="
@@ -428,7 +515,7 @@ def main():
             if not bids or not asks:
 
                 print(
-                    "Order book unavailable"
+                    "Order book unavailable."
                 )
 
                 time.sleep(1)
@@ -436,13 +523,13 @@ def main():
                 continue
 
             best_bid = max(
-                Decimal(str(x))
-                for x in bids.keys()
+                Decimal(str(price))
+                for price in bids.keys()
             )
 
             best_ask = min(
-                Decimal(str(x))
-                for x in asks.keys()
+                Decimal(str(price))
+                for price in asks.keys()
             )
 
             mid = (
@@ -455,9 +542,9 @@ def main():
                 * Decimal("10000")
             )
 
-            # ----------------------------------
-            # Strategy decision
-            # ----------------------------------
+            # ==================================
+            # STRATEGY
+            # ==================================
 
             if previous_mid is not None:
 
@@ -477,7 +564,6 @@ def main():
 
                     if direction:
 
-                        # Conservative paper quantity.
                         quantity = Decimal("1")
 
                         entry_price = (
@@ -502,14 +588,15 @@ def main():
                             )
 
                             print(
-                                f"ENTRY | {direction} "
-                                f"{quantity} DOGE "
+                                f"ENTRY | "
+                                f"{direction} | "
+                                f"{quantity} DOGE | "
                                 f"@ {entry_price}"
                             )
 
-                # ----------------------------------
-                # Exit existing position
-                # ----------------------------------
+                # ==================================
+                # EXIT
+                # ==================================
 
                 if paper.position != 0:
 
@@ -532,7 +619,7 @@ def main():
 
                         print(
                             f"EXIT | "
-                            f"price={mid} "
+                            f"price={mid} | "
                             f"net_pnl={pnl:.6f} INR"
                         )
 
@@ -549,30 +636,20 @@ def main():
         except Exception as error:
 
             print(
-                "ERROR:",
+                "MARKET ERROR:",
                 repr(error),
             )
 
         time.sleep(1)
 
-    # ------------------------------------------
-    # Final report
-    # ------------------------------------------
+    # ==========================================
+    # FINAL REPORT
+    # ==========================================
 
     if paper.position != 0:
 
-        print(
-            "\nOpen paper position remains:"
-        )
-
-        print(
-            "Position:",
-            paper.position,
-        )
-
-        print(
-            "Entry:",
-            paper.entry_price,
+        paper.mark_to_market(
+            previous_mid
         )
 
     print(
@@ -588,6 +665,11 @@ def main():
     )
 
     print(
+        "Pair:",
+        pair,
+    )
+
+    print(
         "Starting balance:",
         paper.starting_balance,
         "INR",
@@ -596,6 +678,12 @@ def main():
     print(
         "Realized PnL:",
         paper.realized_pnl,
+        "INR",
+    )
+
+    print(
+        "Unrealized PnL:",
+        paper.unrealized_pnl,
         "INR",
     )
 
@@ -616,7 +704,7 @@ def main():
     )
 
     print(
-        "Final balance:",
+        "Final paper balance:",
         paper.balance,
         "INR",
     )

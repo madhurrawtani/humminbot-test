@@ -6,7 +6,10 @@ import hashlib
 import requests
 from decimal import Decimal
 
-from strategy import DogeFuturesStrategy, FuturesConfig
+from strategy import (
+    DogeFuturesStrategy,
+    FuturesConfig,
+)
 
 
 BASE_URL = "https://api.coindcx.com"
@@ -118,11 +121,11 @@ class PaperAccount:
 
         self.realized_pnl = Decimal("0")
         self.unrealized_pnl = Decimal("0")
-
         self.fees = Decimal("0")
 
         self.entries = 0
         self.exits = 0
+
         self.wins = 0
         self.losses = 0
 
@@ -157,7 +160,6 @@ class PaperAccount:
         )
 
         if equity > self.equity_peak:
-
             self.equity_peak = equity
 
         drawdown = (
@@ -165,7 +167,6 @@ class PaperAccount:
         )
 
         if drawdown > self.max_drawdown:
-
             self.max_drawdown = drawdown
 
     def enter(
@@ -184,7 +185,12 @@ class PaperAccount:
 
         notional = price * quantity
 
-        if notional > strategy.position_margin:
+        # 5x maximum exposure.
+        if (
+            notional
+            > strategy.config.capital_inr
+            * strategy.config.max_leverage
+        ):
             return False
 
         fee = strategy.fee(notional)
@@ -296,7 +302,10 @@ def main():
     print("API credentials detected.")
     print("Pair:", PAIR)
     print("Duration:", TEST_SECONDS, "seconds")
-    print("Capital: ₹10,000 virtual")
+    print("Capital: ₹1000 virtual")
+    print("Maximum leverage: 5x")
+    print("Risk per trade: 1%")
+    print("Daily loss limit: 5%")
     print("Live orders: DISABLED")
 
     # -----------------------------------------
@@ -331,10 +340,10 @@ def main():
             )
         )
 
-    except requests.HTTPError as error:
+    except requests.HTTPError:
 
         print(
-            "Wallet unavailable."
+            "Futures wallet unavailable."
         )
 
         print(
@@ -346,14 +355,26 @@ def main():
     # -----------------------------------------
 
     config = FuturesConfig(
-        capital_inr=Decimal("10000"),
-        leverage=Decimal("1"),
+        capital_inr=Decimal("1000"),
+        max_leverage=Decimal("5"),
+        risk_per_trade=Decimal("0.01"),
+        max_risk_per_trade=Decimal("0.02"),
+        daily_loss_limit=Decimal("0.05"),
+        max_consecutive_losses=3,
+        cooldown_seconds=3600,
         maker_fee_bps=Decimal("2.36"),
         round_trip_fee_bps=Decimal("4.72"),
-        profit_buffer_bps=Decimal("1.00"),
-        max_margin_fraction=Decimal("0.80"),
-        position_margin_fraction=Decimal("0.10"),
-        max_position_seconds=60,
+        slippage_buffer_bps=Decimal("1.00"),
+        max_spread_pct=Decimal("0.10"),
+        imbalance_window=20,
+        candle_window=20,
+        fast_ema_period=5,
+        slow_ema_period=13,
+        atr_period=14,
+        stop_atr_multiplier=Decimal("1.5"),
+        target_atr_multiplier=Decimal("2.0"),
+        minimum_score=Decimal("0.60"),
+        max_position_seconds=300,
     )
 
     strategy = DogeFuturesStrategy(config)
@@ -362,44 +383,38 @@ def main():
         config.capital_inr
     )
 
-    print("\n=== PAPER ACCOUNT ===")
+    prices = []
+    candles = []
+
+    print("\n=== PAPER CONFIG ===")
 
     print(
-        "Starting balance:",
-        paper.starting_balance,
-        "INR",
+        "Risk/trade:",
+        config.capital_inr
+        * config.risk_per_trade,
+        "INR"
     )
 
     print(
-        "Maximum margin:",
-        strategy.max_margin,
-        "INR",
+        "Max risk/trade:",
+        config.capital_inr
+        * config.max_risk_per_trade,
+        "INR"
     )
 
     print(
-        "Position margin:",
-        strategy.position_margin,
-        "INR",
-    )
-
-    print(
-        "Round-trip fee:",
-        config.round_trip_fee_bps,
-        "bps",
-    )
-
-    print(
-        "Minimum required edge:",
-        strategy.minimum_net_edge_bps,
-        "bps",
+        "Daily loss cap:",
+        config.capital_inr
+        * config.daily_loss_limit,
+        "INR"
     )
 
     # -----------------------------------------
-    # Test
+    # Test loop
     # -----------------------------------------
 
     print(
-        "\n=== STARTING 300-SECOND PAPER TEST ==="
+        "\n=== STARTING 300-SECOND TEST ==="
     )
 
     end_time = (
@@ -407,9 +422,15 @@ def main():
         + TEST_SECONDS
     )
 
-    previous_mid = None
+    candle_start = time.time()
+    candle_open = None
+    candle_high = None
+    candle_low = None
+    candle_close = None
 
     while time.monotonic() < end_time:
+
+        now = time.time()
 
         book = get_orderbook()
 
@@ -439,13 +460,97 @@ def main():
         )
 
         mid = (
-            best_bid + best_ask
+            best_bid
+            + best_ask
         ) / Decimal("2")
 
-        spread = strategy.spread_bps(
-            best_bid,
-            best_ask,
+        prices.append(mid)
+
+        if len(prices) > 200:
+            prices.pop(0)
+
+        # -------------------------------------
+        # Build 1-second candles
+        # -------------------------------------
+
+        if candle_open is None:
+
+            candle_open = mid
+            candle_high = mid
+            candle_low = mid
+            candle_close = mid
+            candle_start = now
+
+        else:
+
+            candle_high = max(
+                candle_high,
+                mid
+            )
+
+            candle_low = min(
+                candle_low,
+                mid
+            )
+
+            candle_close = mid
+
+        if now - candle_start >= 1:
+
+            candles.append(
+                {
+                    "open": candle_open,
+                    "high": candle_high,
+                    "low": candle_low,
+                    "close": candle_close,
+                }
+            )
+
+            if len(candles) > 100:
+                candles.pop(0)
+
+            candle_open = None
+
+        # -------------------------------------
+        # Calculate indicators
+        # -------------------------------------
+
+        imbalance = (
+            strategy.orderbook_imbalance(
+                bids,
+                asks
+            )
         )
+
+        atr_value = strategy.atr(
+            candles
+        )
+
+        signal, score = (
+            strategy.composite_signal(
+                prices,
+                imbalance,
+                atr_value,
+                best_bid,
+                best_ask,
+            )
+        )
+
+        # -------------------------------------
+        # Daily risk halt
+        # -------------------------------------
+
+        if strategy.daily_loss_exceeded():
+
+            print(
+                "DAILY LOSS LIMIT REACHED."
+            )
+
+            break
+
+        # -------------------------------------
+        # Mark current position
+        # -------------------------------------
 
         paper.mark(mid)
 
@@ -455,11 +560,15 @@ def main():
 
         if paper.position != 0:
 
-            if strategy.should_exit(
-                paper.entry_price,
-                mid,
-                time.time(),
-            ):
+            should_exit, reason = (
+                strategy.should_exit(
+                    mid,
+                    signal,
+                    now,
+                )
+            )
+
+            if should_exit:
 
                 pnl = paper.exit(
                     mid,
@@ -468,10 +577,18 @@ def main():
 
                 strategy.close(mid)
 
+                strategy.register_result(
+                    pnl,
+                    now,
+                )
+
                 print(
                     f"EXIT | "
+                    f"{reason} | "
                     f"price={mid} | "
-                    f"net={pnl:.6f} INR"
+                    f"PnL={pnl:.6f} | "
+                    f"loss_streak="
+                    f"{strategy.consecutive_losses}"
                 )
 
         # -------------------------------------
@@ -480,80 +597,63 @@ def main():
 
         if (
             paper.position == 0
-            and previous_mid is not None
+            and signal in ("LONG", "SHORT")
+            and strategy.can_trade(now)
+            and atr_value is not None
         ):
 
-            if strategy.should_enter(
-                previous_mid,
+            if strategy.edge_is_sufficient(
+                atr_value,
                 mid,
-                best_bid,
-                best_ask,
             ):
 
-                direction = (
-                    strategy.choose_direction(
-                        previous_mid,
+                quantity = (
+                    strategy.position_size(
                         mid,
+                        atr_value,
                     )
                 )
 
-                if direction:
+                if quantity > 0:
 
-                    # Position size based on
-                    # ₹10,000 capital.
-                    #
-                    # At current DOGE price this
-                    # will remain far above the
-                    # ₹6 minimum notional.
-
-                    quantity = (
-                        strategy.position_margin
-                        / mid
-                    )
-
-                    # Respect 1-DOGE quantity
-                    # increment.
-                    quantity = (
-                        quantity
-                        // Decimal("1")
-                    ) * Decimal("1")
-
-                    if quantity < Decimal("1"):
-                        quantity = Decimal("1")
-
+                    # Paper fill at bid/ask.
                     price = (
                         best_ask
-                        if direction == "LONG"
+                        if signal == "LONG"
                         else best_bid
                     )
 
-                    if paper.enter(
-                        direction,
+                    entered = paper.enter(
+                        signal,
                         price,
                         quantity,
                         strategy,
-                    ):
+                    )
 
-                        strategy.open(
-                            direction,
+                    if entered:
+
+                        strategy.open_position(
+                            signal,
                             price,
-                            quantity,
-                            time.time(),
+                            atr_value,
+                            now,
                         )
 
                         print(
                             f"ENTRY | "
-                            f"{direction} | "
-                            f"qty={quantity} | "
-                            f"price={price}"
+                            f"{signal} | "
+                            f"qty={quantity:.2f} | "
+                            f"price={price} | "
+                            f"score={score:.2f} | "
+                            f"ATR={atr_value}"
                         )
-
-        previous_mid = mid
 
         print(
             f"BID={best_bid} "
             f"ASK={best_ask} "
-            f"SPREAD={spread:.3f}bps "
+            f"IMB={imbalance:.3f} "
+            f"SIGNAL={signal} "
+            f"SCORE={score:.2f} "
             f"POS={paper.position} "
             f"REALIZED={paper.realized_pnl:.6f} "
             f"UNREALIZED={paper.unrealized_pnl:.6f}"
@@ -565,7 +665,7 @@ def main():
     # Final report
     # -----------------------------------------
 
-    paper.mark(previous_mid)
+    paper.mark(mid)
 
     total_pnl = (
         paper.realized_pnl
@@ -592,85 +692,82 @@ def main():
     print(" PAPER TEST COMPLETE")
     print("==========================================")
 
-    print(
-        "Pair:",
-        PAIR,
-    )
+    print("Pair:", PAIR)
 
     print(
         "Starting capital:",
         paper.starting_balance,
-        "INR",
+        "INR"
+    )
+
+    print(
+        "Entries:",
+        paper.entries
+    )
+
+    print(
+        "Completed exits:",
+        paper.exits
+    )
+
+    print(
+        "Wins:",
+        paper.wins
+    )
+
+    print(
+        "Losses:",
+        paper.losses
+    )
+
+    print(
+        "Win rate:",
+        f"{win_rate:.2f}%"
     )
 
     print(
         "Realized PnL:",
         paper.realized_pnl,
-        "INR",
+        "INR"
     )
 
     print(
         "Unrealized PnL:",
         paper.unrealized_pnl,
-        "INR",
+        "INR"
     )
 
     print(
         "Total PnL:",
         total_pnl,
-        "INR",
+        "INR"
     )
 
     print(
         "Return:",
-        f"{return_pct:.6f}%",
+        f"{return_pct:.4f}%"
     )
 
     print(
         "Fees:",
         paper.fees,
-        "INR",
-    )
-
-    print(
-        "Entries:",
-        paper.entries,
-    )
-
-    print(
-        "Completed exits:",
-        paper.exits,
-    )
-
-    print(
-        "Wins:",
-        paper.wins,
-    )
-
-    print(
-        "Losses:",
-        paper.losses,
-    )
-
-    print(
-        "Win rate:",
-        f"{win_rate:.2f}%",
+        "INR"
     )
 
     print(
         "Max drawdown:",
         paper.max_drawdown,
-        "INR",
+        "INR"
     )
 
     print(
-        "Final paper balance:",
+        "Final balance:",
         paper.balance,
-        "INR",
+        "INR"
     )
 
     print(
-        "\nLIVE ORDERS SENT: 0"
+        "LIVE ORDERS SENT: 0"
     )
 
 

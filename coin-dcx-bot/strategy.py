@@ -4,28 +4,27 @@ from decimal import Decimal
 
 @dataclass
 class FuturesConfig:
-    capital_inr: Decimal = Decimal("1000")
+    capital_inr: Decimal = Decimal("10000")
     leverage: Decimal = Decimal("1")
 
-    # CoinDCX DOGE_USDT instrument reports 0.0236%.
     maker_fee_bps: Decimal = Decimal("2.36")
-
-    # Entry + exit maker fees.
     round_trip_fee_bps: Decimal = Decimal("4.72")
 
-    # Additional minimum profit buffer.
     profit_buffer_bps: Decimal = Decimal("1.00")
 
-    # Never use the complete paper balance as margin.
     max_margin_fraction: Decimal = Decimal("0.80")
 
-    # Maximum paper-position lifetime.
     max_position_seconds: int = 60
+
+    # Use a reasonable fraction of available paper capital
+    # for each position.
+    position_margin_fraction: Decimal = Decimal("0.10")
 
 
 class DogeFuturesStrategy:
 
     def __init__(self, config=None):
+
         self.config = config or FuturesConfig()
 
         self.position = Decimal("0")
@@ -39,19 +38,30 @@ class DogeFuturesStrategy:
 
     @property
     def max_margin(self):
+
         return (
             self.config.capital_inr
             * self.config.max_margin_fraction
         )
 
     @property
+    def position_margin(self):
+
+        return (
+            self.max_margin
+            * self.config.position_margin_fraction
+        )
+
+    @property
     def minimum_net_edge_bps(self):
+
         return (
             self.config.round_trip_fee_bps
             + self.config.profit_buffer_bps
         )
 
     def fee(self, notional):
+
         return (
             Decimal(str(notional))
             * self.config.maker_fee_bps
@@ -59,6 +69,7 @@ class DogeFuturesStrategy:
         )
 
     def mid_price(self, bid, ask):
+
         return (
             Decimal(str(bid))
             + Decimal(str(ask))
@@ -78,23 +89,6 @@ class DogeFuturesStrategy:
             (ask - bid)
             / mid
             * Decimal("10000")
-        )
-
-    def quote_prices(self, bid, ask):
-
-        bid = Decimal(str(bid))
-        ask = Decimal(str(ask))
-
-        return bid, ask
-
-    def should_quote(self, bid, ask):
-
-        bid = Decimal(str(bid))
-        ask = Decimal(str(ask))
-
-        return (
-            bid > 0
-            and ask > bid
         )
 
     def calculate_move_bps(
@@ -148,10 +142,7 @@ class DogeFuturesStrategy:
         bid = Decimal(str(bid))
         ask = Decimal(str(ask))
 
-        if previous_mid <= 0:
-            return False
-
-        if current_mid <= 0:
+        if previous_mid <= 0 or current_mid <= 0:
             return False
 
         if ask <= bid:
@@ -162,12 +153,8 @@ class DogeFuturesStrategy:
             current_mid,
         )
 
-        # This is intentionally much lower than the
-        # old 6-bps requirement. The strategy is now
-        # based on short-term order-book movement.
-        signal_threshold_bps = Decimal("1.00")
-
-        if movement_bps < signal_threshold_bps:
+        # Current strategy signal.
+        if movement_bps < Decimal("1.00"):
             return False
 
         return True
@@ -287,9 +274,7 @@ class DogeFuturesStrategy:
             entry_fee + exit_fee
         )
 
-        net_pnl = (
-            gross_pnl - total_fee
-        )
+        net_pnl = gross_pnl - total_fee
 
         self.realized_pnl += net_pnl
         self.total_fees += total_fee

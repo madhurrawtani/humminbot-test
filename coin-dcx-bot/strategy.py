@@ -4,226 +4,488 @@ from decimal import Decimal
 
 @dataclass
 class FuturesConfig:
-    capital_inr: Decimal = Decimal("10000")
-    leverage: Decimal = Decimal("1")
+    capital_inr: Decimal = Decimal("1000")
 
+    # Maximum allowed leverage for the strategy.
+    max_leverage: Decimal = Decimal("5")
+
+    # Risk controls.
+    risk_per_trade: Decimal = Decimal("0.01")       # 1% = ₹10
+    max_risk_per_trade: Decimal = Decimal("0.02")   # 2% = ₹20
+    daily_loss_limit: Decimal = Decimal("0.05")     # 5% = ₹50
+
+    # Circuit breaker.
+    max_consecutive_losses: int = 3
+    cooldown_seconds: int = 3600
+
+    # CoinDCX DOGE futures instrument data.
     maker_fee_bps: Decimal = Decimal("2.36")
+
+    # Conservative allowance for the complete round trip.
     round_trip_fee_bps: Decimal = Decimal("4.72")
 
-    profit_buffer_bps: Decimal = Decimal("1.00")
+    # Extra buffer above fees.
+    slippage_buffer_bps: Decimal = Decimal("1.00")
 
-    max_margin_fraction: Decimal = Decimal("0.80")
+    # Market filters.
+    max_spread_pct: Decimal = Decimal("0.10")
+    imbalance_window: int = 20
+    candle_window: int = 20
 
-    max_position_seconds: int = 60
+    # Momentum.
+    fast_ema_period: int = 5
+    slow_ema_period: int = 13
 
-    # Use a reasonable fraction of available paper capital
-    # for each position.
-    position_margin_fraction: Decimal = Decimal("0.10")
+    # ATR.
+    atr_period: int = 14
+    stop_atr_multiplier: Decimal = Decimal("1.5")
+    target_atr_multiplier: Decimal = Decimal("2.0")
+
+    # Signal.
+    minimum_score: Decimal = Decimal("0.60")
+
+    # Position timeout.
+    max_position_seconds: int = 300
 
 
 class DogeFuturesStrategy:
 
     def __init__(self, config=None):
-
         self.config = config or FuturesConfig()
 
         self.position = Decimal("0")
         self.entry_price = Decimal("0")
-        self.entry_side = None
         self.entry_time = 0
+        self.entry_side = None
+
+        self.stop_price = Decimal("0")
+        self.target_price = Decimal("0")
 
         self.realized_pnl = Decimal("0")
         self.total_fees = Decimal("0")
-        self.trade_count = 0
 
-    @property
-    def max_margin(self):
+        self.consecutive_losses = 0
+        self.cooldown_until = 0
 
-        return (
-            self.config.capital_inr
-            * self.config.max_margin_fraction
-        )
-
-    @property
-    def position_margin(self):
-
-        return (
-            self.max_margin
-            * self.config.position_margin_fraction
-        )
-
-    @property
-    def minimum_net_edge_bps(self):
-
-        return (
-            self.config.round_trip_fee_bps
-            + self.config.profit_buffer_bps
-        )
+    # --------------------------------------------------
+    # Fees
+    # --------------------------------------------------
 
     def fee(self, notional):
-
         return (
             Decimal(str(notional))
             * self.config.maker_fee_bps
             / Decimal("10000")
         )
 
-    def mid_price(self, bid, ask):
+    @property
+    def required_edge_bps(self):
+        return (
+            self.config.round_trip_fee_bps
+            + self.config.slippage_buffer_bps
+        )
 
+    # --------------------------------------------------
+    # Basic market calculations
+    # --------------------------------------------------
+
+    def mid_price(self, bid, ask):
         return (
             Decimal(str(bid))
             + Decimal(str(ask))
         ) / Decimal("2")
 
-    def spread_bps(self, bid, ask):
-
-        bid = Decimal(str(bid))
-        ask = Decimal(str(ask))
-
+    def spread_pct(self, bid, ask):
         mid = self.mid_price(bid, ask)
 
         if mid <= 0:
-            return Decimal("0")
+            return Decimal("999")
 
         return (
-            (ask - bid)
+            (Decimal(str(ask)) - Decimal(str(bid)))
             / mid
-            * Decimal("10000")
+            * Decimal("100")
         )
 
-    def calculate_move_bps(
-        self,
-        old_price,
-        new_price,
-    ):
+    # --------------------------------------------------
+    # Order-book imbalance
+    # --------------------------------------------------
 
-        old_price = Decimal(str(old_price))
-        new_price = Decimal(str(new_price))
+    def orderbook_imbalance(self, bids, asks):
 
-        if old_price <= 0:
+        bid_volume = sum(
+            Decimal(str(qty))
+            for qty in bids.values()
+        )
+
+        ask_volume = sum(
+            Decimal(str(qty))
+            for qty in asks.values()
+        )
+
+        total = bid_volume + ask_volume
+
+        if total <= 0:
             return Decimal("0")
 
         return (
-            abs(new_price - old_price)
-            / old_price
-            * Decimal("10000")
+            bid_volume - ask_volume
+        ) / total
+
+    # --------------------------------------------------
+    # EMA
+    # --------------------------------------------------
+
+    def ema(self, values, period):
+
+        if len(values) < period:
+            return None
+
+        values = [
+            Decimal(str(x))
+            for x in values
+        ]
+
+        multiplier = (
+            Decimal("2")
+            / Decimal(str(period + 1))
         )
 
-    def choose_direction(
+        result = values[0]
+
+        for value in values[1:]:
+            result = (
+                (value - result)
+                * multiplier
+                + result
+            )
+
+        return result
+
+    # --------------------------------------------------
+    # ROC
+    # --------------------------------------------------
+
+    def roc(self, prices, period=5):
+
+        if len(prices) <= period:
+            return Decimal("0")
+
+        old = Decimal(str(prices[-period - 1]))
+        new = Decimal(str(prices[-1]))
+
+        if old <= 0:
+            return Decimal("0")
+
+        return (
+            (new - old)
+            / old
+            * Decimal("100")
+        )
+
+    # --------------------------------------------------
+    # ATR
+    # --------------------------------------------------
+
+    def atr(self, candles):
+
+        if len(candles) < self.config.atr_period + 1:
+            return None
+
+        true_ranges = []
+
+        previous_close = None
+
+        for candle in candles:
+
+            high = Decimal(str(candle["high"]))
+            low = Decimal(str(candle["low"]))
+            close = Decimal(str(candle["close"]))
+
+            if previous_close is None:
+
+                tr = high - low
+
+            else:
+
+                tr = max(
+                    high - low,
+                    abs(high - previous_close),
+                    abs(low - previous_close),
+                )
+
+            true_ranges.append(tr)
+            previous_close = close
+
+        period = self.config.atr_period
+
+        return (
+            sum(true_ranges[-period:])
+            / Decimal(str(period))
+        )
+
+    # --------------------------------------------------
+    # Volatility regime
+    # --------------------------------------------------
+
+    def volatility_regime(
         self,
-        previous_mid,
-        current_mid,
+        atr_value,
+        price,
     ):
 
-        previous_mid = Decimal(str(previous_mid))
-        current_mid = Decimal(str(current_mid))
+        if atr_value is None or price <= 0:
+            return "UNKNOWN"
 
-        if current_mid > previous_mid:
-            return "LONG"
+        atr_pct = (
+            atr_value
+            / price
+            * Decimal("100")
+        )
 
-        if current_mid < previous_mid:
-            return "SHORT"
+        # Conservative starting regime bands.
+        if atr_pct < Decimal("0.15"):
+            return "LOW"
 
-        return None
+        if atr_pct > Decimal("1.50"):
+            return "EXTREME"
 
-    def should_enter(
+        if atr_pct > Decimal("0.80"):
+            return "HIGH"
+
+        return "NORMAL"
+
+    # --------------------------------------------------
+    # Composite signal
+    # --------------------------------------------------
+
+    def composite_signal(
         self,
-        previous_mid,
-        current_mid,
+        prices,
+        imbalance,
+        atr_value,
         bid,
         ask,
     ):
 
-        if self.position != 0:
-            return False
+        if len(prices) < self.config.slow_ema_period:
+            return "NONE", Decimal("0")
 
-        previous_mid = Decimal(str(previous_mid))
-        current_mid = Decimal(str(current_mid))
-        bid = Decimal(str(bid))
-        ask = Decimal(str(ask))
+        mid = self.mid_price(bid, ask)
 
-        if previous_mid <= 0 or current_mid <= 0:
-            return False
-
-        if ask <= bid:
-            return False
-
-        movement_bps = self.calculate_move_bps(
-            previous_mid,
-            current_mid,
+        spread = self.spread_pct(
+            bid,
+            ask,
         )
 
-        # Current strategy signal.
-        if movement_bps < Decimal("1.00"):
-            return False
+        if spread > self.config.max_spread_pct:
+            return "NONE", Decimal("0")
 
-        return True
+        regime = self.volatility_regime(
+            atr_value,
+            mid,
+        )
 
-    def should_exit(
+        if regime in ("UNKNOWN", "EXTREME"):
+            return "NONE", Decimal("0")
+
+        fast = self.ema(
+            prices,
+            self.config.fast_ema_period,
+        )
+
+        slow = self.ema(
+            prices,
+            self.config.slow_ema_period,
+        )
+
+        if fast is None or slow is None:
+            return "NONE", Decimal("0")
+
+        roc = self.roc(
+            prices,
+            5,
+        )
+
+        score = Decimal("0")
+
+        # 40% order-book imbalance.
+        if imbalance > Decimal("0.20"):
+            score += Decimal("0.40")
+
+        elif imbalance < Decimal("-0.20"):
+            score -= Decimal("0.40")
+
+        # 35% EMA direction.
+        if fast > slow:
+            score += Decimal("0.35")
+
+        elif fast < slow:
+            score -= Decimal("0.35")
+
+        # 25% short-term ROC.
+        if roc > Decimal("0.05"):
+            score += Decimal("0.25")
+
+        elif roc < Decimal("-0.05"):
+            score -= Decimal("0.25")
+
+        if score >= self.config.minimum_score:
+            return "LONG", score
+
+        if score <= -self.config.minimum_score:
+            return "SHORT", score
+
+        return "NONE", score
+
+    # --------------------------------------------------
+    # Expected edge
+    # --------------------------------------------------
+
+    def expected_edge_bps(
         self,
-        entry_price,
-        current_price,
-        current_time,
+        atr_value,
+        price,
     ):
 
-        if self.position == 0:
-            return False
+        if atr_value is None or price <= 0:
+            return Decimal("0")
 
-        entry_price = Decimal(str(entry_price))
-        current_price = Decimal(str(current_price))
+        atr_bps = (
+            atr_value
+            / price
+            * Decimal("10000")
+        )
 
-        if entry_price <= 0:
-            return False
+        expected_move = (
+            atr_bps
+            * self.config.target_atr_multiplier
+        )
 
-        if self.position > 0:
+        return expected_move
 
-            move_bps = (
-                (current_price - entry_price)
-                / entry_price
-                * Decimal("10000")
+    def edge_is_sufficient(
+        self,
+        atr_value,
+        price,
+    ):
+
+        return (
+            self.expected_edge_bps(
+                atr_value,
+                price,
             )
+            > self.required_edge_bps
+        )
 
-        else:
+    # --------------------------------------------------
+    # Risk-based position sizing
+    # --------------------------------------------------
 
-            move_bps = (
-                (entry_price - current_price)
-                / entry_price
-                * Decimal("10000")
-            )
+    def position_size(
+        self,
+        price,
+        atr_value,
+    ):
 
-        if move_bps >= self.minimum_net_edge_bps:
-            return True
+        if atr_value is None or price <= 0:
+            return Decimal("0")
 
-        if (
-            current_time - self.entry_time
-            >= self.config.max_position_seconds
-        ):
-            return True
+        risk_amount = (
+            self.config.capital_inr
+            * self.config.risk_per_trade
+        )
 
-        return False
+        stop_distance = (
+            atr_value
+            * self.config.stop_atr_multiplier
+        )
 
-    def open(
+        if stop_distance <= 0:
+            return Decimal("0")
+
+        quantity = (
+            risk_amount
+            / stop_distance
+        )
+
+        # Respect 5x leverage.
+        max_notional = (
+            self.config.capital_inr
+            * self.config.max_leverage
+        )
+
+        max_quantity = (
+            max_notional
+            / price
+        )
+
+        if quantity > max_quantity:
+            quantity = max_quantity
+
+        return quantity
+
+    # --------------------------------------------------
+    # Position management
+    # --------------------------------------------------
+
+    def open_position(
         self,
         side,
         price,
-        quantity,
+        atr_value,
         timestamp,
     ):
 
         if self.position != 0:
             return False
 
-        price = Decimal(str(price))
-        quantity = Decimal(str(quantity))
-
-        if price <= 0 or quantity <= 0:
+        if atr_value is None:
             return False
 
+        quantity = self.position_size(
+            price,
+            atr_value,
+        )
+
+        if quantity <= 0:
+            return False
+
+        price = Decimal(str(price))
+
+        stop_distance = (
+            atr_value
+            * self.config.stop_atr_multiplier
+        )
+
+        target_distance = (
+            atr_value
+            * self.config.target_atr_multiplier
+        )
+
         if side == "LONG":
+
             self.position = quantity
 
+            self.stop_price = (
+                price - stop_distance
+            )
+
+            self.target_price = (
+                price + target_distance
+            )
+
         elif side == "SHORT":
+
             self.position = -quantity
+
+            self.stop_price = (
+                price + stop_distance
+            )
+
+            self.target_price = (
+                price - target_distance
+            )
 
         else:
             return False
@@ -234,55 +496,94 @@ class DogeFuturesStrategy:
 
         return True
 
-    def close(self, price):
+    def should_exit(
+        self,
+        price,
+        current_signal,
+        timestamp,
+    ):
 
         if self.position == 0:
-            return Decimal("0")
+            return False, "NONE"
 
         price = Decimal(str(price))
-        quantity = abs(self.position)
 
         if self.position > 0:
 
-            gross_pnl = (
-                price - self.entry_price
-            ) * quantity
+            if price <= self.stop_price:
+                return True, "STOP"
+
+            if price >= self.target_price:
+                return True, "TARGET"
+
+            if current_signal == "SHORT":
+                return True, "REVERSAL"
 
         else:
 
-            gross_pnl = (
-                self.entry_price - price
-            ) * quantity
+            if price >= self.stop_price:
+                return True, "STOP"
 
-        entry_notional = (
-            self.entry_price * quantity
+            if price <= self.target_price:
+                return True, "TARGET"
+
+            if current_signal == "LONG":
+                return True, "REVERSAL"
+
+        if (
+            timestamp - self.entry_time
+            >= self.config.max_position_seconds
+        ):
+            return True, "TIMEOUT"
+
+        return False, "NONE"
+
+    # --------------------------------------------------
+    # Cooldown
+    # --------------------------------------------------
+
+    def can_trade(self, timestamp):
+
+        return timestamp >= self.cooldown_until
+
+    def register_result(
+        self,
+        net_pnl,
+        timestamp,
+    ):
+
+        net_pnl = Decimal(str(net_pnl))
+
+        if net_pnl < 0:
+
+            self.consecutive_losses += 1
+
+        else:
+
+            self.consecutive_losses = 0
+
+        if (
+            self.consecutive_losses
+            >= self.config.max_consecutive_losses
+        ):
+
+            self.cooldown_until = (
+                timestamp
+                + self.config.cooldown_seconds
+            )
+
+    # --------------------------------------------------
+    # Daily risk
+    # --------------------------------------------------
+
+    def daily_loss_exceeded(self):
+
+        loss_limit = (
+            self.config.capital_inr
+            * self.config.daily_loss_limit
         )
 
-        exit_notional = (
-            price * quantity
+        return (
+            self.realized_pnl
+            <= -loss_limit
         )
-
-        entry_fee = self.fee(
-            entry_notional
-        )
-
-        exit_fee = self.fee(
-            exit_notional
-        )
-
-        total_fee = (
-            entry_fee + exit_fee
-        )
-
-        net_pnl = gross_pnl - total_fee
-
-        self.realized_pnl += net_pnl
-        self.total_fees += total_fee
-        self.trade_count += 1
-
-        self.position = Decimal("0")
-        self.entry_price = Decimal("0")
-        self.entry_side = None
-        self.entry_time = 0
-
-        return net_pnl

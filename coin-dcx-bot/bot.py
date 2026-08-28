@@ -1,178 +1,137 @@
-from dataclasses import dataclass
+import os
+import time
+import json
+import hmac
+import hashlib
+import requests
 from decimal import Decimal
 
-
-@dataclass
-class FuturesConfig:
-    capital_inr: Decimal = Decimal("1000")
-    leverage: Decimal = Decimal("1")
-
-    # Actual instrument-specific maker fee will be supplied later.
-    maker_fee_bps: Decimal = Decimal("2.36")
-
-    # Entry + exit.
-    round_trip_fee_bps: Decimal = Decimal("4.72")
-
-    # Minimum expected net edge after fees.
-    profit_buffer_bps: Decimal = Decimal("1.00")
-
-    # Don't use the whole account.
-    max_margin_fraction: Decimal = Decimal("0.80")
-
-    # Maximum time we allow a paper position to remain open.
-    max_position_seconds: int = 60
+from strategy import DogeFuturesStrategy, FuturesConfig
 
 
-class DogeFuturesStrategy:
+BASE_URL = "https://api.coindcx.com"
+PAIR = "B-DOGE_USDT"
+TEST_SECONDS = 300
 
-    def __init__(self, config=None):
 
-        self.config = config or FuturesConfig()
+API_KEY = os.getenv("COINDCX_API_KEY")
+API_SECRET = os.getenv("COINDCX_SECRET_KEY")
+
+
+def signed_get(path, body=None):
+    body = body or {}
+    body["timestamp"] = int(time.time() * 1000)
+
+    payload = json.dumps(
+        body,
+        separators=(",", ":")
+    )
+
+    signature = hmac.new(
+        API_SECRET.encode(),
+        payload.encode(),
+        hashlib.sha256
+    ).hexdigest()
+
+    headers = {
+        "Content-Type": "application/json",
+        "X-AUTH-APIKEY": API_KEY,
+        "X-AUTH-SIGNATURE": signature,
+    }
+
+    r = requests.get(
+        BASE_URL + path,
+        data=payload,
+        headers=headers,
+        timeout=10,
+    )
+
+    r.raise_for_status()
+    return r.json()
+
+
+def public_get(path, params=None):
+    r = requests.get(
+        BASE_URL + path,
+        params=params,
+        timeout=10,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def get_instrument():
+    return public_get(
+        "/exchange/v1/derivatives/futures/data/instrument",
+        {
+            "pair": PAIR,
+            "margin_currency_short_name": "INR",
+        },
+    )
+
+
+def get_wallet():
+    return signed_get(
+        "/exchange/v1/derivatives/futures/wallets"
+    )
+
+
+def get_positions():
+    return signed_get(
+        "/exchange/v1/derivatives/futures/positions",
+        {
+            "page": "1",
+            "size": "50",
+            "pairs": PAIR,
+            "margin_currency_short_name": ["INR"],
+        },
+    )
+
+
+def get_orderbook():
+    r = requests.get(
+        f"https://public.coindcx.com/"
+        f"market_data/v3/orderbook/{PAIR}-futures/50",
+        timeout=10,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+class PaperAccount:
+
+    def __init__(self, capital):
+        self.starting_balance = Decimal(str(capital))
+        self.balance = Decimal(str(capital))
 
         self.position = Decimal("0")
         self.entry_price = Decimal("0")
         self.entry_side = None
-        self.entry_time = 0
 
         self.realized_pnl = Decimal("0")
-        self.total_fees = Decimal("0")
-        self.trade_count = 0
+        self.unrealized_pnl = Decimal("0")
+        self.fees = Decimal("0")
 
-    @property
-    def max_margin(self):
-        return (
-            self.config.capital_inr
-            * self.config.max_margin_fraction
-        )
+        self.entries = 0
+        self.exits = 0
 
-    @property
-    def minimum_net_edge_bps(self):
-        return (
-            self.config.round_trip_fee_bps
-            + self.config.profit_buffer_bps
-        )
-
-    def fee(self, notional):
-        return (
-            Decimal(str(notional))
-            * self.config.maker_fee_bps
-            / Decimal("10000")
-        )
-
-    def mid_price(self, bid, ask):
-        return (
-            Decimal(str(bid))
-            + Decimal(str(ask))
-        ) / Decimal("2")
-
-    def spread_bps(self, bid, ask):
-
-        mid = self.mid_price(bid, ask)
-
-        if mid <= 0:
-            return Decimal("0")
-
-        return (
-            (
-                Decimal(str(ask))
-                - Decimal(str(bid))
-            )
-            / mid
-            * Decimal("10000")
-        )
-
-    def quote_prices(self, bid, ask):
-
-        bid = Decimal(str(bid))
-        ask = Decimal(str(ask))
-
-        mid = self.mid_price(
-            bid,
-            ask,
-        )
-
-        spread = ask - bid
-
-        # Place passive quotes around the existing market.
-        #
-        # We don't require the market to instantly move 6 bps.
-        # Instead we participate around the current order book.
-
-        buy_price = bid
-
-        sell_price = ask
-
-        return buy_price, sell_price
-
-    def should_quote(self, bid, ask):
-
-        if bid <= 0 or ask <= 0:
-            return False
-
-        if ask <= bid:
-            return False
-
-        return True
-
-    def should_exit(
-        self,
-        entry_price,
-        current_price,
-        current_time,
-    ):
-
+    def mark(self, price):
         if self.position == 0:
-            return False
+            self.unrealized_pnl = Decimal("0")
+            return
 
-        entry_price = Decimal(str(entry_price))
-        current_price = Decimal(str(current_price))
-
-        if entry_price <= 0:
-            return False
+        price = Decimal(str(price))
 
         if self.position > 0:
-
-            move_bps = (
-                (
-                    current_price
-                    - entry_price
-                )
-                / entry_price
-                * Decimal("10000")
-            )
-
+            self.unrealized_pnl = (
+                price - self.entry_price
+            ) * abs(self.position)
         else:
+            self.unrealized_pnl = (
+                self.entry_price - price
+            ) * abs(self.position)
 
-            move_bps = (
-                (
-                    entry_price
-                    - current_price
-                )
-                / entry_price
-                * Decimal("10000")
-            )
-
-        # Position must have enough movement to cover
-        # both maker fees plus our safety buffer.
-        if move_bps >= self.minimum_net_edge_bps:
-            return True
-
-        # Safety timeout.
-        if (
-            current_time - self.entry_time
-            >= self.config.max_position_seconds
-        ):
-            return True
-
-        return False
-
-    def open(
-        self,
-        side,
-        price,
-        quantity,
-        timestamp,
-    ):
+    def enter(self, side, price, quantity, strategy):
 
         if self.position != 0:
             return False
@@ -180,25 +139,31 @@ class DogeFuturesStrategy:
         price = Decimal(str(price))
         quantity = Decimal(str(quantity))
 
-        if price <= 0 or quantity <= 0:
+        notional = price * quantity
+
+        if notional > strategy.max_margin:
             return False
 
+        fee = strategy.fee(notional)
+
+        if fee > self.balance:
+            return False
+
+        self.balance -= fee
+        self.fees += fee
+
         self.position = (
-            quantity
-            if side == "LONG"
+            quantity if side == "LONG"
             else -quantity
         )
 
         self.entry_price = price
         self.entry_side = side
-        self.entry_time = timestamp
+        self.entries += 1
 
         return True
 
-    def close(
-        self,
-        price,
-    ):
+    def exit(self, price, strategy):
 
         if self.position == 0:
             return Decimal("0")
@@ -207,48 +172,269 @@ class DogeFuturesStrategy:
         quantity = abs(self.position)
 
         if self.position > 0:
-
-            gross_pnl = (
+            gross = (
                 price - self.entry_price
             ) * quantity
-
         else:
-
-            gross_pnl = (
+            gross = (
                 self.entry_price - price
             ) * quantity
 
-        entry_notional = (
+        entry_fee = strategy.fee(
             self.entry_price * quantity
         )
 
-        exit_notional = (
+        exit_fee = strategy.fee(
             price * quantity
         )
 
-        entry_fee = self.fee(
-            entry_notional
-        )
+        net = gross - entry_fee - exit_fee
 
-        exit_fee = self.fee(
-            exit_notional
-        )
-
-        total_fee = (
-            entry_fee + exit_fee
-        )
-
-        net_pnl = (
-            gross_pnl - total_fee
-        )
-
-        self.realized_pnl += net_pnl
-        self.total_fees += total_fee
-        self.trade_count += 1
+        self.balance += gross - exit_fee
+        self.realized_pnl += net
+        self.fees += exit_fee
+        self.exits += 1
 
         self.position = Decimal("0")
         self.entry_price = Decimal("0")
         self.entry_side = None
-        self.entry_time = 0
+        self.unrealized_pnl = Decimal("0")
 
-        return net_pnl
+        return net
+
+
+def main():
+
+    print("==========================================")
+    print(" COINDCX DOGE FUTURES PAPER BOT")
+    print("==========================================")
+
+    if not API_KEY:
+        raise RuntimeError("Missing COINDCX_API_KEY")
+
+    if not API_SECRET:
+        raise RuntimeError("Missing COINDCX_SECRET_KEY")
+
+    print("API credentials detected.")
+    print("Pair:", PAIR)
+    print("Test duration:", TEST_SECONDS, "seconds")
+    print("Live orders: DISABLED")
+
+    # -----------------------------------------
+    # Instrument
+    # -----------------------------------------
+
+    instrument = get_instrument()
+
+    print("\n=== INSTRUMENT ===")
+    print(json.dumps(instrument, indent=2))
+
+    # -----------------------------------------
+    # Wallet
+    # -----------------------------------------
+
+    print("\n=== FUTURES WALLET ===")
+
+    try:
+        wallet = get_wallet()
+        print(json.dumps(wallet, indent=2))
+    except requests.HTTPError as e:
+        print(
+            "Wallet unavailable; continuing paper-only:",
+            e
+        )
+
+    # -----------------------------------------
+    # Positions
+    # -----------------------------------------
+
+    print("\n=== POSITIONS ===")
+
+    try:
+        positions = get_positions()
+        print(json.dumps(positions, indent=2))
+    except requests.HTTPError as e:
+        print(
+            "Positions unavailable; continuing paper-only:",
+            e
+        )
+
+    # -----------------------------------------
+    # Strategy
+    # -----------------------------------------
+
+    config = FuturesConfig(
+        capital_inr=Decimal("1000"),
+        leverage=Decimal("1"),
+        maker_fee_bps=Decimal("2.36"),
+        round_trip_fee_bps=Decimal("4.72"),
+        profit_buffer_bps=Decimal("1.00"),
+        max_margin_fraction=Decimal("0.80"),
+    )
+
+    strategy = DogeFuturesStrategy(config)
+    paper = PaperAccount(config.capital_inr)
+
+    print("\n=== PAPER ACCOUNT ===")
+    print("Capital:", config.capital_inr, "INR")
+    print("Max margin:", strategy.max_margin)
+    print(
+        "Minimum net edge:",
+        strategy.minimum_net_edge_bps,
+        "bps"
+    )
+
+    # -----------------------------------------
+    # 5-minute market loop
+    # -----------------------------------------
+
+    print("\n=== STARTING 300-SECOND TEST ===")
+
+    end_time = time.monotonic() + TEST_SECONDS
+    previous_mid = None
+
+    while time.monotonic() < end_time:
+
+        book = get_orderbook()
+
+        bids = book.get("bids", {})
+        asks = book.get("asks", {})
+
+        if not bids or not asks:
+            time.sleep(1)
+            continue
+
+        best_bid = max(
+            Decimal(str(x))
+            for x in bids
+        )
+
+        best_ask = min(
+            Decimal(str(x))
+            for x in asks
+        )
+
+        mid = (
+            best_bid + best_ask
+        ) / Decimal("2")
+
+        spread = strategy.spread_bps(
+            best_bid,
+            best_ask
+        )
+
+        paper.mark(mid)
+
+        # -------------------------------------
+        # Paper position management
+        # -------------------------------------
+
+        if paper.position != 0:
+
+            if strategy.should_exit(
+                paper.entry_price,
+                mid,
+                time.time(),
+            ):
+
+                pnl = paper.exit(
+                    mid,
+                    strategy
+                )
+
+                strategy.close(mid)
+
+                print(
+                    f"EXIT | "
+                    f"{mid} | "
+                    f"PnL={pnl:.6f}"
+                )
+
+        # -------------------------------------
+        # Entry
+        # -------------------------------------
+
+        if (
+            paper.position == 0
+            and previous_mid is not None
+        ):
+
+            if strategy.should_enter(
+                previous_mid,
+                mid,
+                best_bid,
+                best_ask,
+            ):
+
+                direction = strategy.choose_direction(
+                    previous_mid,
+                    mid
+                )
+
+                if direction:
+
+                    quantity = Decimal("1")
+
+                    price = (
+                        best_ask
+                        if direction == "LONG"
+                        else best_bid
+                    )
+
+                    if paper.enter(
+                        direction,
+                        price,
+                        quantity,
+                        strategy,
+                    ):
+
+                        strategy.open(
+                            direction,
+                            price,
+                            quantity,
+                            time.time(),
+                        )
+
+                        print(
+                            f"ENTRY | "
+                            f"{direction} | "
+                            f"{price}"
+                        )
+
+        previous_mid = mid
+
+        print(
+            f"BID={best_bid} "
+            f"ASK={best_ask} "
+            f"SPREAD={spread:.3f}bps "
+            f"POS={paper.position} "
+            f"REALIZED={paper.realized_pnl:.6f} "
+            f"UNREALIZED={paper.unrealized_pnl:.6f}"
+        )
+
+        time.sleep(1)
+
+    # -----------------------------------------
+    # Final report
+    # -----------------------------------------
+
+    if paper.position != 0:
+        paper.mark(previous_mid)
+
+    print("\n==========================================")
+    print(" PAPER TEST COMPLETE")
+    print("==========================================")
+
+    print("Pair:", PAIR)
+    print("Starting:", paper.starting_balance, "INR")
+    print("Entries:", paper.entries)
+    print("Exits:", paper.exits)
+    print("Realized PnL:", paper.realized_pnl, "INR")
+    print("Unrealized PnL:", paper.unrealized_pnl, "INR")
+    print("Fees:", paper.fees, "INR")
+    print("Final balance:", paper.balance, "INR")
+    print("LIVE ORDERS: NONE")
+
+
+if __name__ == "__main__":
+    main()
